@@ -15,7 +15,7 @@
 #include <stdbool.h>
 #include <string.h>
 
-#include <bluetooth/bluetooth.h>
+#include <bluetooth/bluetooth.h> /* IWYU pragma: keep */
 #include <bluetooth/hci.h>
 
 #include <gio/gio.h>
@@ -25,7 +25,7 @@
 #include "ba-device.h"
 #include "ba-rfcomm.h"
 #include "ba-transport.h"
-#include "bluealsa-config.h"
+#include "ba-config.h"
 #include "dbus.h"
 #include "utils.h"
 #include "shared/log.h"
@@ -70,10 +70,9 @@ static void upower_signal_display_device_changed(GDBusConnection *conn, const ch
 		struct ba_adapter *a;
 		struct ba_device *d;
 		struct ba_transport *t;
-		size_t i;
 
 		/* find every RFCOMM profile and send update battery signal */
-		for (i = 0; i < HCI_MAX_DEV; i++) {
+		for (size_t i = 0; i < HCI_MAX_DEV; i++) {
 			if ((a = ba_adapter_lookup(i)) == NULL)
 				continue;
 			pthread_mutex_lock(&a->devices_mutex);
@@ -82,7 +81,7 @@ static void upower_signal_display_device_changed(GDBusConnection *conn, const ch
 				pthread_mutex_lock(&d->transports_mutex);
 				g_hash_table_iter_init(&iter_t, d->transports);
 				while (g_hash_table_iter_next(&iter_t, NULL, (gpointer)&t))
-					if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_SCO &&
+					if (t->profile & BA_TRANSPORT_PROFILE_MASK_SCO &&
 							t->sco.rfcomm != NULL)
 						ba_rfcomm_send_signal(t->sco.rfcomm, BA_RFCOMM_SIGNAL_UPDATE_BATTERY);
 				pthread_mutex_unlock(&d->transports_mutex);

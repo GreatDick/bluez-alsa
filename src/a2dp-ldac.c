@@ -1,6 +1,6 @@
 /*
  * BlueALSA - a2dp-ldac.c
- * Copyright (c) 2016-2022 Arkadiusz Bokowy
+ * Copyright (c) 2016-2025 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -10,10 +10,7 @@
 
 #include "a2dp-ldac.h"
 
-#if ENABLE_LDAC
-
 #include <errno.h>
-#include <endian.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -23,13 +20,14 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#include <glib.h>
-
 #include <ldacBT.h>
 #include <ldacBT_abr.h>
 
 #include "a2dp.h"
-#include "bluealsa-config.h"
+#include "ba-transport.h"
+#include "ba-transport-pcm.h"
+#include "ba-config.h"
+#include "bluealsa-dbus.h"
 #include "io.h"
 #include "rtp.h"
 #include "utils.h"
@@ -39,91 +37,86 @@
 #include "shared/log.h"
 #include "shared/rt.h"
 
-static const struct a2dp_channel_mode a2dp_ldac_channels[] = {
-	{ A2DP_CHM_MONO, 1, LDAC_CHANNEL_MODE_MONO },
-	{ A2DP_CHM_DUAL_CHANNEL, 2, LDAC_CHANNEL_MODE_DUAL },
-	{ A2DP_CHM_STEREO, 2, LDAC_CHANNEL_MODE_STEREO },
+static const struct a2dp_bit_mapping a2dp_ldac_channels[] = {
+	{ LDAC_CHANNEL_MODE_MONO, .ch = { 1, a2dp_channel_map_mono } },
+	{ LDAC_CHANNEL_MODE_DUAL, .ch = { 2, a2dp_channel_map_stereo } },
+	{ LDAC_CHANNEL_MODE_STEREO, .ch = { 2, a2dp_channel_map_stereo } },
+	{ 0 }
 };
 
-static const struct a2dp_sampling_freq a2dp_ldac_samplings[] = {
-	{ 44100, LDAC_SAMPLING_FREQ_44100 },
-	{ 48000, LDAC_SAMPLING_FREQ_48000 },
-	{ 88200, LDAC_SAMPLING_FREQ_88200 },
-	{ 96000, LDAC_SAMPLING_FREQ_96000 },
+static const struct a2dp_bit_mapping a2dp_ldac_rates[] = {
+	{ LDAC_SAMPLING_FREQ_44100, { 44100 } },
+	{ LDAC_SAMPLING_FREQ_48000, { 48000 } },
+	{ LDAC_SAMPLING_FREQ_88200, { 88200 } },
+	{ LDAC_SAMPLING_FREQ_96000, { 96000 } },
+	{ LDAC_SAMPLING_FREQ_176400, { 176400 } },
+	{ LDAC_SAMPLING_FREQ_192000, { 192000 } },
+	{ 0 }
 };
 
-struct a2dp_codec a2dp_ldac_sink = {
-	.dir = A2DP_SINK,
-	.codec_id = A2DP_CODEC_VENDOR_LDAC,
-	.capabilities.ldac = {
-		.info = A2DP_SET_VENDOR_ID_CODEC_ID(LDAC_VENDOR_ID, LDAC_CODEC_ID),
-		.channel_mode =
-			LDAC_CHANNEL_MODE_MONO |
-			LDAC_CHANNEL_MODE_DUAL |
-			LDAC_CHANNEL_MODE_STEREO,
-		/* NOTE: Used LDAC library does not support
-		 *       frequencies higher than 96 kHz. */
-		.frequency =
-			LDAC_SAMPLING_FREQ_44100 |
-			LDAC_SAMPLING_FREQ_48000 |
-			LDAC_SAMPLING_FREQ_88200 |
-			LDAC_SAMPLING_FREQ_96000,
-	},
-	.capabilities_size = sizeof(a2dp_ldac_t),
-	.channels[0] = a2dp_ldac_channels,
-	.channels_size[0] = ARRAYSIZE(a2dp_ldac_channels),
-	.samplings[0] = a2dp_ldac_samplings,
-	.samplings_size[0] = ARRAYSIZE(a2dp_ldac_samplings),
-};
-
-struct a2dp_codec a2dp_ldac_source = {
-	.dir = A2DP_SOURCE,
-	.codec_id = A2DP_CODEC_VENDOR_LDAC,
-	.capabilities.ldac = {
-		.info = A2DP_SET_VENDOR_ID_CODEC_ID(LDAC_VENDOR_ID, LDAC_CODEC_ID),
-		.channel_mode =
-			LDAC_CHANNEL_MODE_MONO |
-			LDAC_CHANNEL_MODE_DUAL |
-			LDAC_CHANNEL_MODE_STEREO,
-		/* NOTE: Used LDAC library does not support
-		 *       frequencies higher than 96 kHz. */
-		.frequency =
-			LDAC_SAMPLING_FREQ_44100 |
-			LDAC_SAMPLING_FREQ_48000 |
-			LDAC_SAMPLING_FREQ_88200 |
-			LDAC_SAMPLING_FREQ_96000,
-	},
-	.capabilities_size = sizeof(a2dp_ldac_t),
-	.channels[0] = a2dp_ldac_channels,
-	.channels_size[0] = ARRAYSIZE(a2dp_ldac_channels),
-	.samplings[0] = a2dp_ldac_samplings,
-	.samplings_size[0] = ARRAYSIZE(a2dp_ldac_samplings),
-};
-
-void a2dp_ldac_init(void) {
+static void a2dp_ldac_caps_intersect(
+		void *capabilities,
+		const void *mask) {
+	a2dp_caps_bitwise_intersect(capabilities, mask, sizeof(a2dp_ldac_t));
 }
 
-void a2dp_ldac_transport_init(struct ba_transport *t) {
-
-	const struct a2dp_codec *codec = t->a2dp.codec;
-
-	/* LDAC library internally for encoding uses 31-bit integers or
-	 * floats, so the best choice for PCM sample is signed 32-bit. */
-	t->a2dp.pcm.format = BA_TRANSPORT_PCM_FORMAT_S32_4LE;
-
-	t->a2dp.pcm.channels = a2dp_codec_lookup_channels(codec,
-			t->a2dp.configuration.ldac.channel_mode, false);
-	t->a2dp.pcm.sampling = a2dp_codec_lookup_frequency(codec,
-			t->a2dp.configuration.ldac.frequency, false);
-
+static int a2dp_ldac_caps_foreach_channel_mode(
+		const void *capabilities,
+		enum a2dp_stream stream,
+		a2dp_bit_mapping_foreach_func func,
+		void *userdata) {
+	const a2dp_ldac_t *caps = capabilities;
+	if (stream == A2DP_MAIN)
+		return a2dp_bit_mapping_foreach(a2dp_ldac_channels, caps->channel_mode, func, userdata);
+	return -1;
 }
 
-static void *a2dp_ldac_enc_thread(struct ba_transport_thread *th) {
+static int a2dp_ldac_caps_foreach_sample_rate(
+		const void *capabilities,
+		enum a2dp_stream stream,
+		a2dp_bit_mapping_foreach_func func,
+		void *userdata) {
+	const a2dp_ldac_t *caps = capabilities;
+	if (stream == A2DP_MAIN)
+		return a2dp_bit_mapping_foreach(a2dp_ldac_rates, caps->sampling_freq, func, userdata);
+	return -1;
+}
+
+static void a2dp_ldac_caps_select_channel_mode(
+		void *capabilities,
+		enum a2dp_stream stream,
+		unsigned int channels) {
+	a2dp_ldac_t *caps = capabilities;
+	if (stream == A2DP_MAIN)
+		caps->channel_mode = a2dp_bit_mapping_lookup_value(a2dp_ldac_channels,
+				caps->channel_mode, channels);
+}
+
+static void a2dp_ldac_caps_select_sample_rate(
+		void *capabilities,
+		enum a2dp_stream stream,
+		unsigned int rate) {
+	a2dp_ldac_t *caps = capabilities;
+	if (stream == A2DP_MAIN)
+		caps->sampling_freq = a2dp_bit_mapping_lookup_value(a2dp_ldac_rates,
+				caps->sampling_freq, rate);
+}
+
+static struct a2dp_caps_helpers a2dp_ldac_caps_helpers = {
+	.intersect = a2dp_ldac_caps_intersect,
+	.has_stream = a2dp_caps_has_main_stream_only,
+	.foreach_channel_mode = a2dp_ldac_caps_foreach_channel_mode,
+	.foreach_sample_rate = a2dp_ldac_caps_foreach_sample_rate,
+	.select_channel_mode = a2dp_ldac_caps_select_channel_mode,
+	.select_sample_rate = a2dp_ldac_caps_select_sample_rate,
+};
+
+void *a2dp_ldac_enc_thread(struct ba_transport_pcm *t_pcm) {
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pcm_thread_cleanup), t_pcm);
 
-	struct ba_transport *t = th->t;
+	struct ba_transport *t = t_pcm->t;
 	struct io_poll io = { .timeout = -1 };
 
 	HANDLE_LDAC_BT handle;
@@ -143,18 +136,18 @@ static void *a2dp_ldac_enc_thread(struct ba_transport_thread *th) {
 	pthread_cleanup_push(PTHREAD_CLEANUP(ldac_ABR_free_handle), handle_abr);
 
 	const a2dp_ldac_t *configuration = &t->a2dp.configuration.ldac;
-	const size_t sample_size = BA_TRANSPORT_PCM_FORMAT_BYTES(t->a2dp.pcm.format);
-	const unsigned int channels = t->a2dp.pcm.channels;
-	const unsigned int samplerate = t->a2dp.pcm.sampling;
+	const size_t sample_size = BA_TRANSPORT_PCM_FORMAT_BYTES(t_pcm->format);
+	const unsigned int channels = t_pcm->channels;
+	const unsigned int rate = t_pcm->rate;
 	const size_t ldac_pcm_samples = LDACBT_ENC_LSU * channels;
 
 	if (ldacBT_init_handle_encode(handle, t->mtu_write, config.ldac_eqmid,
-				configuration->channel_mode, LDACBT_SMPL_FMT_S32, samplerate) == -1) {
+				configuration->channel_mode, LDACBT_SMPL_FMT_S32, rate) == -1) {
 		error("Couldn't initialize LDAC encoder: %s", ldacBT_strerror(ldacBT_get_error_code(handle)));
 		goto fail_init;
 	}
 
-	if (ldac_ABR_Init(handle_abr, 1000 * ldac_pcm_samples / channels / samplerate) == -1) {
+	if (ldac_ABR_Init(handle_abr, 1000 * ldac_pcm_samples / channels / rate) == -1) {
 		error("Couldn't initialize LDAC ABR");
 		goto fail_init;
 	}
@@ -174,6 +167,11 @@ static void *a2dp_ldac_enc_thread(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
+	const unsigned int ldac_delay_frames = 128;
+	/* Get the total delay introduced by the codec. */
+	t_pcm->codec_delay_dms = ldac_delay_frames * 10000 / rate;
+	ba_transport_pcm_delay_sync(t_pcm, BA_DBUS_PCM_UPDATE_DELAY);
+
 	rtp_header_t *rtp_header;
 	rtp_media_header_t *rtp_media_header;
 	/* initialize RTP headers and get anchor for payload */
@@ -181,25 +179,30 @@ static void *a2dp_ldac_enc_thread(struct ba_transport_thread *th) {
 			(void **)&rtp_media_header, sizeof(*rtp_media_header));
 
 	struct rtp_state rtp = { .synced = false };
-	/* RTP clock frequency equal to audio samplerate */
-	rtp_state_init(&rtp, samplerate, samplerate);
+	/* RTP clock frequency equal to PCM sample rate */
+	rtp_state_init(&rtp, rate, rate);
 
-	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_set_state_running(th);;) {
+	debug_transport_pcm_thread_loop(t_pcm, "START");
+	for (ba_transport_pcm_state_set_running(t_pcm);;) {
 
-		ssize_t samples;
-		if ((samples = io_poll_and_read_pcm(&io, &t->a2dp.pcm,
-						pcm.tail, ffb_len_in(&pcm))) <= 0) {
-			if (samples == -1)
-				error("PCM poll and read error: %s", strerror(errno));
+		switch (io_poll_and_read_pcm(&io, t_pcm, &pcm)) {
+		case -1:
+			if (errno == ESTALE) {
+				int tmp;
+				/* flush encoder internal buffers */
+				ldacBT_encode(handle, NULL, &tmp, rtp_payload, &tmp, &tmp);
+				ffb_rewind(&pcm);
+				continue;
+			}
+			error("PCM poll and read error: %s", strerror(errno));
+			/* fall-through */
+		case 0:
 			ba_transport_stop_if_no_clients(t);
 			continue;
 		}
 
-		ffb_seek(&pcm, samples);
-		samples = ffb_len_out(&pcm);
-
 		int16_t *input = pcm.data;
+		size_t samples = ffb_len_out(&pcm);
 		size_t input_len = samples;
 
 		/* encode and transfer obtained data */
@@ -237,10 +240,17 @@ static void *a2dp_ldac_enc_thread(struct ba_transport_thread *th) {
 				errno = 0;
 
 				ssize_t len = ffb_blen_out(&bt);
-				if ((len = io_bt_write(th, bt.data, len)) <= 0) {
+				if ((len = io_bt_write(t_pcm, bt.data, len)) <= 0) {
 					if (len == -1)
 						error("BT write error: %s", strerror(errno));
 					goto fail;
+				}
+
+				if (!io.initiated) {
+					/* Get the delay due to codec processing. */
+					t_pcm->processing_delay_dms = asrsync_get_dms_since_last_sync(&io.asrs);
+					ba_transport_pcm_delay_sync(t_pcm, BA_DBUS_PCM_UPDATE_DELAY);
+					io.initiated = true;
 				}
 
 				if (errno == EAGAIN)
@@ -255,13 +265,10 @@ static void *a2dp_ldac_enc_thread(struct ba_transport_thread *th) {
 			}
 
 			unsigned int pcm_frames = pcm_samples / channels;
-			/* keep data transfer at a constant bit rate */
+			/* Keep data transfer at a constant bit rate. */
 			asrsync_sync(&io.asrs, pcm_frames);
 			/* move forward RTP timestamp clock */
 			rtp_state_update(&rtp, pcm_frames);
-
-			/* update busy delay (encoding overhead) */
-			t->a2dp.pcm.delay = asrsync_get_busy_usec(&io.asrs) / 100;
 
 		}
 
@@ -274,9 +281,7 @@ static void *a2dp_ldac_enc_thread(struct ba_transport_thread *th) {
 	}
 
 fail:
-	debug_transport_thread_loop(th, "EXIT");
-	ba_transport_thread_set_state_stopping(th);
-	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	debug_transport_pcm_thread_loop(t_pcm, "EXIT");
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -290,12 +295,13 @@ fail_open_ldac:
 }
 
 #if HAVE_LDAC_DECODE
-static void *a2dp_ldac_dec_thread(struct ba_transport_thread *th) {
+__attribute__ ((weak))
+void *a2dp_ldac_dec_thread(struct ba_transport_pcm *t_pcm) {
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pcm_thread_cleanup), t_pcm);
 
-	struct ba_transport *t = th->t;
+	struct ba_transport *t = t_pcm->t;
 	struct io_poll io = { .timeout = -1 };
 
 	HANDLE_LDAC_BT handle;
@@ -307,11 +313,11 @@ static void *a2dp_ldac_dec_thread(struct ba_transport_thread *th) {
 	pthread_cleanup_push(PTHREAD_CLEANUP(ldacBT_free_handle), handle);
 
 	const a2dp_ldac_t *configuration = &t->a2dp.configuration.ldac;
-	const size_t sample_size = BA_TRANSPORT_PCM_FORMAT_BYTES(t->a2dp.pcm.format);
-	const unsigned int channels = t->a2dp.pcm.channels;
-	const unsigned int samplerate = t->a2dp.pcm.sampling;
+	const size_t sample_size = BA_TRANSPORT_PCM_FORMAT_BYTES(t_pcm->format);
+	const unsigned int channels = t_pcm->channels;
+	const unsigned int rate = t_pcm->rate;
 
-	if (ldacBT_init_handle_decode(handle, configuration->channel_mode, samplerate, 0, 0, 0) == -1) {
+	if (ldacBT_init_handle_decode(handle, configuration->channel_mode, rate, 0, 0, 0) == -1) {
 		error("Couldn't initialize LDAC decoder: %s", ldacBT_strerror(ldacBT_get_error_code(handle)));
 		goto fail_init;
 	}
@@ -328,14 +334,15 @@ static void *a2dp_ldac_dec_thread(struct ba_transport_thread *th) {
 	}
 
 	struct rtp_state rtp = { .synced = false };
-	/* RTP clock frequency equal to audio samplerate */
-	rtp_state_init(&rtp, samplerate, samplerate);
+	/* RTP clock frequency equal to PCM sample rate */
+	rtp_state_init(&rtp, rate, rate);
 
-	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_set_state_running(th);;) {
+	debug_transport_pcm_thread_loop(t_pcm, "START");
+	for (ba_transport_pcm_state_set_running(t_pcm);;) {
 
-		ssize_t len = ffb_blen_in(&bt);
-		if ((len = io_poll_and_read_bt(&io, th, bt.data, len)) <= 0) {
+		ssize_t len;
+		ffb_rewind(&bt);
+		if ((len = io_poll_and_read_bt(&io, t_pcm, &bt)) <= 0) {
 			if (len == -1)
 				error("BT poll and read error: %s", strerror(errno));
 			goto fail;
@@ -349,7 +356,7 @@ static void *a2dp_ldac_dec_thread(struct ba_transport_thread *th) {
 		int missing_rtp_frames = 0;
 		rtp_state_sync_stream(&rtp, rtp_header, &missing_rtp_frames, NULL);
 
-		if (!ba_transport_pcm_is_active(&t->a2dp.pcm)) {
+		if (!ba_transport_pcm_is_active(t_pcm)) {
 			rtp.synced = false;
 			continue;
 		}
@@ -373,9 +380,9 @@ static void *a2dp_ldac_dec_thread(struct ba_transport_thread *th) {
 			rtp_payload_len -= used;
 
 			const size_t samples = decoded / sample_size;
-			io_pcm_scale(&t->a2dp.pcm, pcm.data, samples);
-			if (io_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
-				error("FIFO write error: %s", strerror(errno));
+			io_pcm_scale(t_pcm, pcm.data, samples);
+			if (io_pcm_write(t_pcm, pcm.data, samples) == -1)
+				error("PCM write error: %s", strerror(errno));
 
 			/* update local state with decoded PCM frames */
 			rtp_state_update(&rtp, samples / channels);
@@ -385,9 +392,7 @@ static void *a2dp_ldac_dec_thread(struct ba_transport_thread *th) {
 	}
 
 fail:
-	debug_transport_thread_loop(th, "EXIT");
-	ba_transport_thread_set_state_stopping(th);
-	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	debug_transport_pcm_thread_loop(t_pcm, "EXIT");
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -399,18 +404,157 @@ fail_open:
 }
 #endif
 
-int a2dp_ldac_transport_start(struct ba_transport *t) {
+static int a2dp_ldac_configuration_select(
+		const struct a2dp_sep *sep,
+		void *capabilities) {
 
-	if (t->type.profile & BA_TRANSPORT_PROFILE_A2DP_SOURCE)
-		return ba_transport_thread_create(&t->thread_enc, a2dp_ldac_enc_thread, "ba-a2dp-ldac", true);
+	a2dp_ldac_t *caps = capabilities;
+	const a2dp_ldac_t saved = *caps;
+
+	/* Narrow capabilities to values supported by BlueALSA. */
+	a2dp_ldac_caps_intersect(caps, &sep->config.capabilities);
+
+	unsigned int sampling_freq = 0;
+	if (a2dp_ldac_caps_foreach_sample_rate(caps, A2DP_MAIN,
+				a2dp_bit_mapping_foreach_get_best_sample_rate, &sampling_freq) != -1)
+		caps->sampling_freq = sampling_freq;
+	else {
+		error("LDAC: No supported sample rates: %#x", saved.sampling_freq);
+		return errno = ENOTSUP, -1;
+	}
+
+	unsigned int channel_mode = 0;
+	if (a2dp_ldac_caps_foreach_channel_mode(caps, A2DP_MAIN,
+				a2dp_bit_mapping_foreach_get_best_channel_mode, &channel_mode) != -1)
+		caps->channel_mode = channel_mode;
+	else {
+		error("LDAC: No supported channel modes: %#x", saved.channel_mode);
+		return errno = ENOTSUP, -1;
+	}
+
+	return 0;
+}
+
+static int a2dp_ldac_configuration_check(
+		const struct a2dp_sep *sep,
+		const void *configuration) {
+
+	const a2dp_ldac_t *conf = configuration;
+	a2dp_ldac_t conf_v = *conf;
+
+	/* Validate configuration against BlueALSA capabilities. */
+	a2dp_ldac_caps_intersect(&conf_v, &sep->config.capabilities);
+
+	if (a2dp_bit_mapping_lookup(a2dp_ldac_rates, conf_v.sampling_freq) == -1) {
+		debug("LDAC: Invalid sample rate: %#x", conf->sampling_freq);
+		return A2DP_CHECK_ERR_RATE;
+	}
+
+	if (a2dp_bit_mapping_lookup(a2dp_ldac_channels, conf_v.channel_mode) == -1) {
+		debug("LDAC: Invalid channel mode: %#x", conf->channel_mode);
+		return A2DP_CHECK_ERR_CHANNEL_MODE;
+	}
+
+	return A2DP_CHECK_OK;
+}
+
+static int a2dp_ldac_transport_init(struct ba_transport *t) {
+
+	ssize_t channels_i;
+	if ((channels_i = a2dp_bit_mapping_lookup(a2dp_ldac_channels,
+					t->a2dp.configuration.ldac.channel_mode)) == -1)
+		return -1;
+
+	ssize_t rate_i;
+	if ((rate_i = a2dp_bit_mapping_lookup(a2dp_ldac_rates,
+					t->a2dp.configuration.ldac.sampling_freq)) == -1)
+		return -1;
+
+	/* LDAC library internally for encoding uses 31-bit integers or
+	 * floats, so the best choice for PCM sample is signed 32-bit. */
+	t->a2dp.pcm.format = BA_TRANSPORT_PCM_FORMAT_S32_4LE;
+	t->a2dp.pcm.channels = a2dp_ldac_channels[channels_i].value;
+	t->a2dp.pcm.rate = a2dp_ldac_rates[rate_i].value;
+
+	memcpy(t->a2dp.pcm.channel_map, a2dp_ldac_channels[channels_i].ch.map,
+			t->a2dp.pcm.channels * sizeof(*t->a2dp.pcm.channel_map));
+
+	return 0;
+}
+
+static int a2dp_ldac_source_init(struct a2dp_sep *sep) {
+	if (config.a2dp.force_mono)
+		sep->config.capabilities.ldac.channel_mode = LDAC_CHANNEL_MODE_MONO;
+	if (config.a2dp.force_44100)
+		sep->config.capabilities.ldac.sampling_freq = LDAC_SAMPLING_FREQ_44100;
+	return 0;
+}
+
+static int a2dp_ldac_source_transport_start(struct ba_transport *t) {
+	return ba_transport_pcm_start(&t->a2dp.pcm, a2dp_ldac_enc_thread, "ba-a2dp-ldac");
+}
+
+struct a2dp_sep a2dp_ldac_source = {
+	.name = "A2DP Source (LDAC)",
+	.config = {
+		.type = A2DP_SOURCE,
+		.codec_id = A2DP_CODEC_VENDOR_ID(LDAC_VENDOR_ID, LDAC_CODEC_ID),
+		.caps_size = sizeof(a2dp_ldac_t),
+		.capabilities.ldac = {
+			.info = A2DP_VENDOR_INFO_INIT(LDAC_VENDOR_ID, LDAC_CODEC_ID),
+			.channel_mode =
+				LDAC_CHANNEL_MODE_MONO |
+				LDAC_CHANNEL_MODE_DUAL |
+				LDAC_CHANNEL_MODE_STEREO,
+			/* NOTE: Used LDAC library does not support
+			 *       frequencies higher than 96 kHz. */
+			.sampling_freq =
+				LDAC_SAMPLING_FREQ_44100 |
+				LDAC_SAMPLING_FREQ_48000 |
+				LDAC_SAMPLING_FREQ_88200 |
+				LDAC_SAMPLING_FREQ_96000,
+		},
+	},
+	.init = a2dp_ldac_source_init,
+	.configuration_select = a2dp_ldac_configuration_select,
+	.configuration_check = a2dp_ldac_configuration_check,
+	.transport_init = a2dp_ldac_transport_init,
+	.transport_start = a2dp_ldac_source_transport_start,
+	.caps_helpers = &a2dp_ldac_caps_helpers,
+};
 
 #if HAVE_LDAC_DECODE
-	if (t->type.profile & BA_TRANSPORT_PROFILE_A2DP_SINK)
-		return ba_transport_thread_create(&t->thread_dec, a2dp_ldac_dec_thread, "ba-a2dp-ldac", true);
-#endif
 
-	g_assert_not_reached();
-	return -1;
+static int a2dp_ldac_sink_transport_start(struct ba_transport *t) {
+	return ba_transport_pcm_start(&t->a2dp.pcm, a2dp_ldac_dec_thread, "ba-a2dp-ldac");
 }
+
+struct a2dp_sep a2dp_ldac_sink = {
+	.name = "A2DP Sink (LDAC)",
+	.config = {
+		.type = A2DP_SINK,
+		.codec_id = A2DP_CODEC_VENDOR_ID(LDAC_VENDOR_ID, LDAC_CODEC_ID),
+		.caps_size = sizeof(a2dp_ldac_t),
+		.capabilities.ldac = {
+			.info = A2DP_VENDOR_INFO_INIT(LDAC_VENDOR_ID, LDAC_CODEC_ID),
+			.channel_mode =
+				LDAC_CHANNEL_MODE_MONO |
+				LDAC_CHANNEL_MODE_DUAL |
+				LDAC_CHANNEL_MODE_STEREO,
+			/* NOTE: Used LDAC library does not support
+			 *       frequencies higher than 96 kHz. */
+			.sampling_freq =
+				LDAC_SAMPLING_FREQ_44100 |
+				LDAC_SAMPLING_FREQ_48000 |
+				LDAC_SAMPLING_FREQ_88200 |
+				LDAC_SAMPLING_FREQ_96000,
+		},
+	},
+	.configuration_select = a2dp_ldac_configuration_select,
+	.configuration_check = a2dp_ldac_configuration_check,
+	.transport_init = a2dp_ldac_transport_init,
+	.transport_start = a2dp_ldac_sink_transport_start,
+	.caps_helpers = &a2dp_ldac_caps_helpers,
+};
 
 #endif

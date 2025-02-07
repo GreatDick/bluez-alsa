@@ -5,30 +5,18 @@ on:
   pull_request:
     branches: [ master ]
 
+env:
+  MAKEFLAGS: -j8
+
 jobs:
 
   coverage:
     if: github.repository_owner == 'arkq'
-    strategy:
-      fail-fast: false
     runs-on: ubuntu-latest
     steps:
+    - uses: actions/checkout@v4
     - name: Install Dependencies
-      run: |
-        sudo apt update
-        sudo apt install --yes --quiet --no-install-recommends \
-          check \
-          lcov \
-          libasound2-dev \
-          libbluetooth-dev \
-          libdbus-1-dev \
-          libfdk-aac-dev \
-          libglib2.0-dev \
-          libmp3lame-dev \
-          libmpg123-dev \
-          libsbc-dev \
-          libspandsp-dev
-    - uses: actions/checkout@v3
+      uses: ./.github/actions/apt-install-deps
     - name: Create Build Environment
       run: |
         mkdir -p ${{ github.workspace }}/{build,m4}
@@ -37,20 +25,28 @@ jobs:
       working-directory: ${{ github.workspace }}/build
       run: |
         ${{ github.workspace }}/configure \
-          --disable-aplay \
           --enable-aac \
+          --enable-aptx \
+          --enable-aptx-hd \
+          --with-libopenaptx \
           --enable-faststream \
+          --enable-lc3-swb \
+          --enable-midi \
           --enable-mp3lame \
           --enable-mpg123 \
           --enable-msbc \
           --enable-ofono \
+          --enable-opus \
           --enable-upower \
+          --enable-aplay \
+          --enable-ctl \
           --enable-test \
           --with-coverage
     - name: Generate Coverage Report
       working-directory: ${{ github.workspace }}/build
       run: make cov
     - name: Upload Coverage to Codecov
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@v5
       with:
-        files: build/cov.info
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: build/lcov.info

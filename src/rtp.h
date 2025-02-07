@@ -73,6 +73,19 @@ typedef struct rtp_mpeg_audio_header {
 	uint16_t offset;
 } __attribute__ ((packed)) rtp_mpeg_audio_header_t;
 
+/**
+ * LHDC media payload header. */
+typedef struct rtp_lhdc_media_header {
+#if __BYTE_ORDER == __BIG_ENDIAN
+	uint8_t frame_count:6;
+	uint8_t latency:2;
+#else
+	uint8_t latency:2;
+	uint8_t frame_count:6;
+#endif
+	uint8_t seq_number;
+} __attribute__ ((packed)) rtp_lhdc_media_header_t;
+
 void *rtp_a2dp_init(void *s, rtp_header_t **hdr, void **phdr, size_t phdr_size);
 void *rtp_a2dp_get_payload(const rtp_header_t *hdr);
 

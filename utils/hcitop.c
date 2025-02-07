@@ -1,6 +1,6 @@
 /*
  * BlueALSA - hcitop.c
- * Copyright (c) 2016-2019 Arkadiusz Bokowy
+ * Copyright (c) 2016-2023 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <ncurses.h>
+#include <curses.h>
 #include <bsd/stdlib.h>
 
 #include <bluetooth/bluetooth.h>
@@ -29,7 +29,7 @@ static const struct {
 	char flag;
 } hci_flags_map[] = {
 	{ HCI_UP, 'U' },
-	{ HCI_INIT, 'I' },
+	{ HCI_INIT, 'N' },
 	{ HCI_RUNNING, 'R' },
 	{ HCI_PSCAN, 'P' },
 	{ HCI_ISCAN, 'I' },
@@ -39,14 +39,11 @@ static const struct {
 	{ HCI_RAW, 'X' },
 };
 
-static int get_devinfo(struct hci_dev_info di[HCI_MAX_DEV]) {
-
-	int i, num;
-
-	for (i = num = 0; i < HCI_MAX_DEV; i++)
+static size_t get_devinfo(struct hci_dev_info di[HCI_MAX_DEV]) {
+	size_t num = 0;
+	for (size_t i = 0; i < HCI_MAX_DEV; i++)
 		if (hci_devinfo(i, &di[num]) == 0)
 			num++;
-
 	return num;
 }
 
@@ -133,7 +130,6 @@ int main(int argc, char *argv[]) {
 	struct hci_dev_info devices[HCI_MAX_DEV];
 	unsigned int byte_rx[HCI_MAX_DEV][3];
 	unsigned int byte_tx[HCI_MAX_DEV][3];
-	size_t ii;
 
 	memset(byte_rx, 0, sizeof(byte_rx));
 	memset(byte_tx, 0, sizeof(byte_tx));
@@ -143,18 +139,17 @@ int main(int argc, char *argv[]) {
 	noecho();
 	curs_set(0);
 
-	for (ii = 1;; ii++) {
+	for (size_t ii = 1;; ii++) {
 
-		const char *template_top = "%5s %9s %8s %8s %8s %8s";
-		const char *template_row = "%5s %9s %8s %8s %8s %8s";
-		int i, count;
+		const char *template_top = "%-5s %4s %-17s %-9s %8s %8s %8s %8s";
+		const char *template_row = "%-5s %4s %17s %9s %8s %8s %8s %8s";
 
 		attron(A_REVERSE);
-		mvprintw(0, 0, template_top, "HCI", "FLAGS", "RX", "TX", "RX/s", "TX/s");
+		mvprintw(0, 0, template_top, "HCI", "BUS", "ADDR", "FLAGS", "RX", "TX", "RX/s", "TX/s");
 		attroff(A_REVERSE);
 
-		count = get_devinfo(devices);
-		for (i = 0; i < HCI_MAX_DEV; i++) {
+		size_t count = get_devinfo(devices);
+		for (size_t i = 0; i < HCI_MAX_DEV; i++) {
 
 			/* shift historic data to the right by one sample */
 			memmove(&byte_rx[i][1], &byte_rx[i][0], sizeof(*byte_rx) - sizeof(**byte_rx));
@@ -163,8 +158,12 @@ int main(int argc, char *argv[]) {
 			if (i >= count)
 				continue;
 
-			char flags[sizeof(hci_flags_map) / sizeof(*hci_flags_map) + 1];
+			char addr[18];
+			ba2str(&devices[i].bdaddr, addr);
 
+			char *bus = hci_dtypetostr(devices[i].type);
+
+			char flags[sizeof(hci_flags_map) / sizeof(*hci_flags_map) + 1];
 			sprint_hci_flags(flags, devices[i].flags);
 
 			byte_rx[i][0] = devices[i].stat.byte_rx;
@@ -186,7 +185,9 @@ int main(int argc, char *argv[]) {
 			humanize_number(rx_rate, sizeof(rx_rate), rate_rx, "B", HN_AUTOSCALE, 0);
 			humanize_number(tx_rate, sizeof(tx_rate), rate_tx, "B", HN_AUTOSCALE, 0);
 
-			mvprintw(i + 1, 0, template_row, devices[i].name, flags, rx, tx, rx_rate, tx_rate);
+			mvprintw(i + 1, 0, template_row,
+					devices[i].name, bus, addr, flags, rx, tx, rx_rate, tx_rate);
+
 		}
 
 		timeout(delay_sec * 1000 + delay_msec);

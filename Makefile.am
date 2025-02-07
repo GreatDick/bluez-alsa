@@ -1,5 +1,5 @@
 # BlueALSA - Makefile.am
-# Copyright (c) 2016-2021 Arkadiusz Bokowy
+# Copyright (c) 2016-2022 Arkadiusz Bokowy
 
 ACLOCAL_AMFLAGS = -I m4
 SUBDIRS = misc src utils
@@ -15,10 +15,12 @@ endif
 if WITH_COVERAGE
 cov:
 	$(MAKE) $(AM_MAKEFLAGS) check CFLAGS="$(CFLAGS) -O0 --coverage"
-	$(LCOV) --capture -d src -d test --exclude '/usr/*' --exclude "*/test/*" -o cov.info
-	$(GENHTML) -o coverage -t $(PACKAGE) cov.info
+	$(LCOV) --capture -d src -d utils -d test \
+		--exclude '$(abs_builddir)/*' --exclude '/usr/*' --exclude '*/test/*' \
+		--output-file lcov.info
+	$(GENHTML) -o coverage -t $(PACKAGE) lcov.info
 clean-local:
 	find $(top_builddir) -name "*.gcno" -delete
 	find $(top_builddir) -name "*.gcda" -delete
-	rm -rf coverage cov.info
+	rm -rf coverage lcov.info
 endif

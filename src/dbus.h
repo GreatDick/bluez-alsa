@@ -1,6 +1,6 @@
 /*
  * BlueALSA - dbus.h
- * Copyright (c) 2016-2021 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -25,7 +25,7 @@
 #define DBUS_IFACE_PROPERTIES       DBUS_SERVICE ".Properties"
 
 /* Compatibility patch for glib < 2.42. */
-#ifndef G_DBUS_ERROR_UNKNOWN_OBJECT
+#if !GLIB_CHECK_VERSION(2, 42, 0)
 # define G_DBUS_ERROR_UNKNOWN_OBJECT G_DBUS_ERROR_FAILED
 #endif
 
@@ -37,8 +37,6 @@ typedef struct _GDBusMethodCallDispatcher {
 	const char *interface;
 	const char *method;
 	void (*handler)(GDBusMethodInvocation *, void *);
-	/* if true, handler will be called in a separate thread */
-	bool asynchronous_call;
 } GDBusMethodCallDispatcher;
 
 typedef struct _GDBusInterfaceSkeletonVTable {
@@ -58,10 +56,6 @@ typedef struct _GDBusInterfaceSkeletonEx {
 	void *userdata;
 } GDBusInterfaceSkeletonEx;
 
-bool g_dbus_dispatch_method_call(const GDBusMethodCallDispatcher *dispatchers,
-		const char *sender, const char *path, const char *interface, const char *method,
-		GDBusMethodInvocation *invocation, void *userdata);
-
 GDBusInterfaceInfo *g_dbus_interface_skeleton_ex_class_get_info(
 		GDBusInterfaceSkeleton *interface_skeleton);
 
@@ -76,8 +70,8 @@ void *g_dbus_interface_skeleton_ex_new(GType interface_skeleton_type,
 		void *userdata, GDestroyNotify userdata_free_func);
 
 bool g_dbus_connection_emit_properties_changed(GDBusConnection *conn,
-		const char *path, const char *interface, GVariantBuilder *props,
-		GError **error);
+		const char *path, const char *interface, GVariant *changed,
+		GVariant *invalidated, GError **error);
 
 GVariantIter *g_dbus_get_managed_objects(GDBusConnection *conn,
 		const char *name, const char *path, GError **error);

@@ -1,6 +1,6 @@
 /*
  * BlueALSA - dbus.c
- * Copyright (c) 2016-2021 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -10,31 +10,12 @@
 
 #include "dbus.h"
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <string.h>
 
 #include <glib-object.h>
 
-#include "shared/defs.h"
 #include "shared/log.h"
-
-/* Compatibility patch for glib < 2.68. */
-#if !GLIB_CHECK_VERSION(2, 68, 0)
-# define g_memdup2 g_memdup
-#endif
-
-struct dispatch_method_caller_data {
-	void (*handler)(GDBusMethodInvocation *, void *);
-	GDBusMethodInvocation *invocation;
-	void *userdata;
-};
-
-static void *dispatch_method_caller(struct dispatch_method_caller_data *data) {
-	data->handler(data->invocation, data->userdata);
-	g_free(data);
-	return NULL;
-}
 
 /**
  * Dispatch incoming D-Bus method call.
@@ -47,7 +28,7 @@ static void *dispatch_method_caller(struct dispatch_method_caller_data *data) {
  * @param invocation D-Bus method invocation structure.
  * @param userdata Data to pass to the handler function.
  * @return On success this function returns true. */
-bool g_dbus_dispatch_method_call(const GDBusMethodCallDispatcher *dispatchers,
+static bool g_dbus_dispatch_method_call(const GDBusMethodCallDispatcher *dispatchers,
 		const char *sender, const char *path, const char *interface, const char *method,
 		GDBusMethodInvocation *invocation, void *userdata) {
 
@@ -64,37 +45,14 @@ bool g_dbus_dispatch_method_call(const GDBusMethodCallDispatcher *dispatchers,
 			continue;
 
 		debug("Called: %s.%s() on %s", interface, method, path);
-
-		if (!dispatcher->asynchronous_call)
-			dispatcher->handler(invocation, userdata);
-		else {
-
-			struct dispatch_method_caller_data data = {
-				.handler = dispatcher->handler,
-				.invocation = invocation,
-				.userdata = userdata,
-			};
-
-			pthread_t thread;
-			int ret;
-
-			void *ptr = g_memdup2(&data, sizeof(data));
-			if ((ret = pthread_create(&thread, NULL,
-							PTHREAD_ROUTINE(dispatch_method_caller), ptr)) != 0) {
-				error("Couldn't create D-Bus call dispatcher: %s", strerror(ret));
-				return false;
-			}
-
-			if ((ret = pthread_detach(thread)) != 0) {
-				error("Couldn't detach D-Bus call dispatcher: %s", strerror(ret));
-				return false;
-			}
-
-		}
+		dispatcher->handler(invocation, userdata);
 
 		return true;
 	}
 
+	/* make sure that we will not leak the invocation object */
+	g_dbus_method_invocation_return_error(invocation, G_DBUS_ERROR,
+			G_DBUS_ERROR_UNKNOWN_METHOD, "Unknown method: %s.%s()", interface, method);
 	return false;
 }
 
@@ -143,7 +101,21 @@ GDBusInterfaceVTable *g_dbus_interface_skeleton_ex_class_get_vtable(
 GVariant *g_dbus_interface_skeleton_ex_class_get_properties(
 		GDBusInterfaceSkeleton *interface_skeleton) {
 	GDBusInterfaceSkeletonEx *iface = (GDBusInterfaceSkeletonEx *)interface_skeleton;
-	return iface->vtable.get_properties(iface->userdata);
+
+	if (iface->vtable.get_properties != NULL)
+		/* use custom properties getter if provided */
+		return iface->vtable.get_properties(iface->userdata);
+
+	GVariantBuilder props;
+	g_variant_builder_init(&props, G_VARIANT_TYPE("a{sv}"));
+
+	GVariant *v;
+	GDBusPropertyInfo **pp = iface->interface_info->properties;
+	for (const GDBusPropertyInfo *p = *pp; *pp != NULL; p = *(++pp))
+		if ((v = iface->vtable.get_property(p->name, NULL, iface->userdata)) != NULL)
+			g_variant_builder_add(&props, "{sv}", p->name, v);
+
+	return g_variant_builder_end(&props);
 }
 
 /**
@@ -177,15 +149,21 @@ void *g_dbus_interface_skeleton_ex_new(GType interface_skeleton_type,
  * @param conn D-Bus connection handler.
  * @param path Valid D-Bus object path.
  * @param interface Interface for which properties have changed.
- * @param props The dictionary builder with changed properties.
+ * @param changed The dictionary variant with changed properties.
+ * @param invalidated The array variant with invalidated properties.
  * @param error NULL GError pointer.
  * @return On success this function returns true. */
 bool g_dbus_connection_emit_properties_changed(GDBusConnection *conn,
-		const char *path, const char *interface, GVariantBuilder *props,
-		GError **error) {
-	return g_dbus_connection_emit_signal(conn, NULL,
-			path, DBUS_IFACE_PROPERTIES, "PropertiesChanged",
-			g_variant_new("(sa{sv}as)", interface, props, NULL), error);
+		const char *path, const char *interface, GVariant *changed,
+		GVariant *invalidated, GError **error) {
+	if (changed == NULL)
+		changed = g_variant_new("a{sv}", NULL);
+	if (invalidated == NULL)
+		invalidated = g_variant_new("as", NULL);
+	return g_dbus_connection_emit_signal(conn, NULL, path,
+			DBUS_IFACE_PROPERTIES, "PropertiesChanged",
+			g_variant_new("(s@a{sv}@as)", interface, changed, invalidated),
+			error);
 }
 
 /**
@@ -208,13 +186,9 @@ GVariantIter *g_dbus_get_managed_objects(GDBusConnection *conn,
 			DBUS_IFACE_OBJECT_MANAGER, "GetManagedObjects");
 
 	if ((rep = g_dbus_connection_send_message_with_reply_sync(conn, msg,
-					G_DBUS_SEND_MESSAGE_FLAGS_NONE, -1, NULL, NULL, error)) == NULL)
+					G_DBUS_SEND_MESSAGE_FLAGS_NONE, -1, NULL, NULL, error)) == NULL ||
+			g_dbus_message_to_gerror(rep, error))
 		goto fail;
-
-	if (g_dbus_message_get_message_type(rep) == G_DBUS_MESSAGE_TYPE_ERROR) {
-		g_dbus_message_to_gerror(rep, error);
-		goto fail;
-	}
 
 	g_variant_get(g_dbus_message_get_body(rep), "(a{oa{sa{sv}}})", &objects);
 
@@ -251,13 +225,9 @@ GVariant *g_dbus_get_property(GDBusConnection *conn, const char *service,
 	g_dbus_message_set_body(msg, g_variant_new("(ss)", interface, property));
 
 	if ((rep = g_dbus_connection_send_message_with_reply_sync(conn, msg,
-					G_DBUS_SEND_MESSAGE_FLAGS_NONE, -1, NULL, NULL, error)) == NULL)
+					G_DBUS_SEND_MESSAGE_FLAGS_NONE, -1, NULL, NULL, error)) == NULL ||
+			g_dbus_message_to_gerror(rep, error))
 		goto fail;
-
-	if (g_dbus_message_get_message_type(rep) == G_DBUS_MESSAGE_TYPE_ERROR) {
-		g_dbus_message_to_gerror(rep, error);
-		goto fail;
-	}
 
 	g_variant_get(g_dbus_message_get_body(rep), "(v)", &value);
 
@@ -287,18 +257,17 @@ bool g_dbus_set_property(GDBusConnection *conn, const char *service,
 		const GVariant *value, GError **error) {
 
 	GDBusMessage *msg = NULL, *rep = NULL;
+	bool rv = false;
 
 	msg = g_dbus_message_new_method_call(service, path, DBUS_IFACE_PROPERTIES, "Set");
 	g_dbus_message_set_body(msg, g_variant_new("(ssv)", interface, property, value));
 
 	if ((rep = g_dbus_connection_send_message_with_reply_sync(conn, msg,
-					G_DBUS_SEND_MESSAGE_FLAGS_NONE, -1, NULL, NULL, error)) == NULL)
+					G_DBUS_SEND_MESSAGE_FLAGS_NONE, -1, NULL, NULL, error)) == NULL ||
+			g_dbus_message_to_gerror(rep, error))
 		goto fail;
 
-	if (g_dbus_message_get_message_type(rep) == G_DBUS_MESSAGE_TYPE_ERROR) {
-		g_dbus_message_to_gerror(rep, error);
-		goto fail;
-	}
+	rv = true;
 
 fail:
 
@@ -307,5 +276,5 @@ fail:
 	if (rep != NULL)
 		g_object_unref(rep);
 
-	return error == NULL;
+	return rv;
 }

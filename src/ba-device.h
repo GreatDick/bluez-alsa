@@ -1,6 +1,6 @@
 /*
  * BlueALSA - ba-device.h
- * Copyright (c) 2016-2021 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -53,7 +53,7 @@ struct ba_device {
 
 		uint16_t vendor_id;
 		uint16_t product_id;
-		char software_version[8];
+		uint16_t sw_version;
 		uint8_t features;
 
 		/* determine whether headset is docked */
@@ -61,8 +61,8 @@ struct ba_device {
 
 	} xapl;
 
-	/* read-only list of available SEPs */
-	const GArray *seps;
+	/* read-only list of available SEP configurations */
+	const GArray *sep_configs;
 
 	/* hash-map with connected transports */
 	pthread_mutex_t transports_mutex;
@@ -78,12 +78,17 @@ struct ba_device *ba_device_new(
 		const bdaddr_t *addr);
 
 struct ba_device *ba_device_lookup(
-		struct ba_adapter *adapter,
+		const struct ba_adapter *adapter,
 		const bdaddr_t *addr);
 struct ba_device *ba_device_ref(
 		struct ba_device *d);
 
 void ba_device_destroy(struct ba_device *d);
 void ba_device_unref(struct ba_device *d);
+
+/**
+ * Return the device SEP configuration as the given index. */
+#define ba_device_sep_cfg_array_index(sep_configs, i) \
+	g_array_index(sep_configs, struct a2dp_sep_config, i)
 
 #endif

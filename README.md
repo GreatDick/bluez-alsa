@@ -1,7 +1,16 @@
 # Bluetooth Audio ALSA Backend
 
-[![Build Status](https://github.com/Arkq/bluez-alsa/actions/workflows/build-and-test.yaml/badge.svg)](https://github.com/Arkq/bluez-alsa/actions/workflows/build-and-test.yaml)
-[![Code Coverage](https://codecov.io/gh/Arkq/bluez-alsa/branch/master/graph/badge.svg)](https://codecov.io/gh/Arkq/bluez-alsa)
+> [!WARNING]
+> The latest source uses new names for some core components:
+>
+> * The `bluealsa` daemon is now called `bluealsad`
+> * The `bluealsa-cli` utility is now called `bluealsactl`
+>
+> See the wiki guide [Migrating from release 4.3.1 or earlier](https://github.com/arkq/bluez-alsa/wiki/Migrating-from-release-4.3.1-or-earlier)
+> for more information.
+
+[![Build Status](https://github.com/arkq/bluez-alsa/actions/workflows/build-and-test.yaml/badge.svg)](https://github.com/arkq/bluez-alsa/actions/workflows/build-and-test.yaml)
+[![Code Coverage](https://codecov.io/gh/arkq/bluez-alsa/branch/master/graph/badge.svg)](https://app.codecov.io/gh/arkq/bluez-alsa)
 
 ## About BlueALSA
 
@@ -30,10 +39,13 @@ BlueALSA is designed specifically for use on small, low-powered, dedicated
 audio or audio/visual systems where the high-level audio management features of
 PulseAudio or PipeWire are not required. The target system must be able to
 function correctly with all its audio applications interfacing directly with
-ALSA. In such systems BlueALSA adds Bluetooth audio support to the existing
-ALSA sound card support.
+ALSA, with only one application at a time using each Bluetooth audio stream.
+In such systems BlueALSA adds Bluetooth audio support to the existing
+ALSA sound card support. Note this means that the applications are constrained
+by the capabilities of the ALSA API, and the higher-level audio processing
+features of audio servers such as PulseAudio and PipeWire are not available.
 
-BlueALSA consists of the daemon `bluealsa`, ALSA plug-ins, and a number of
+BlueALSA consists of the daemon `bluealsad`, ALSA plug-ins, and a number of
 utilities. The basic context is shown in this diagram:
 
 ```mermaid
@@ -41,18 +53,26 @@ flowchart TD
 classDef external fill:#eee,stroke:#333,stroke-width:4px,color:black;
 classDef bluealsa fill:#bbf,stroke:#333,stroke-width:4px,color:black;
 
-A[Bluetooth Adapter] <--> B((bluetoothd\ndaemon))
-A <--> C((bluealsa daemon))
-B <--> C
-C <--> D((bluealsa-aplay))
-C <--> E(("ALSA clients\n(via plugin)"))
-C <--> F((other\nD-Bus clients))
+A[Bluetooth Adapter] <--> B((bluetoothd<br/>daemon))
+A <--> C((bluealsad daemon))
+B <-- dbus --> C
+C <-- dbus --> G((bluealsactl))
+C <-- dbus --> D((bluealsa-aplay))
+D --> E([ALSA libasound])
+E --> K[Speakers]
+C <-- dbus --> F((bluealsa<br/>ALSA plug-ins))
+F <--> H([ALSA libasound])
+H <--> I((ALSA<br/>applications))
+C <-- dbus --> J(("other D-Bus<br/>clients"))
+C <--> L((ALSA MIDI<br/>sequencer))
+L <--> M([ALSA libasound])
+M <--> N((ALSA MIDI<br/>application))
 
-class A,B external;
-class C,D,E,F bluealsa;
+class A,B,E,H,I,J,K,L,M,N external;
+class C,D,F,G bluealsa;
 ```
 
-The heart of BlueALSA is the daemon `bluealsa` which interfaces with the BlueZ
+The heart of BlueALSA is the daemon `bluealsad` which interfaces with the BlueZ
 Bluetooth daemon `bluetoothd` and the local Bluetooth adapter. It handles the
 profile connection and configuration logic for A2DP, HFP and HSP and presents
 the resulting audio streams to applications via D-Bus.
@@ -62,15 +82,19 @@ applications to use the ALSA PCM and mixer interfaces, so that existing ALSA
 applications can access Bluetooth audio devices in the same way as they use
 sound card PCMs and mixers.
 
+In case of BLE MIDI, the daemon creates a simple MIDI port directly in ALSA
+MIDI sequencer, so that ALSA MIDI application can connect to the remote BLE
+MIDI device in the same way as it would connect to a local MIDI device.
+
 BlueALSA also includes a number of utility applications. Of particular note
 are:
+
+* bluealsactl\
+   an application to allow command-line management of the BlueALSA system.
 
 * bluealsa-aplay\
    an application to simplify the task of building a Bluetooth speaker using
    BlueALSA.
-
-* bluealsa-cli\
-   an application to allow command-line management of the BlueALSA system.
 
 * bluealsa-rfcomm\
    a command-line application which provides access to the RFCOMM terminal for
@@ -80,26 +104,31 @@ are:
 
 Build and install instructions are included in the file
 [INSTALL.md](INSTALL.md) and more detailed guidance is available in the
-[wiki](https://github.com/Arkq/bluez-alsa/wiki/Installation-from-source).
+[wiki](https://github.com/arkq/bluez-alsa/wiki/Installation-from-source).
 
 ## Usage
 
-### bluealsa daemon
+### bluealsad daemon
 
-The main component of BlueALSA is a program called `bluealsa`. By default, this
-program shall be run as a root during system startup. It will register
+The main component of BlueALSA is a program called `bluealsad`. By default,
+this program shall be run as a root during system startup. It will register
 `org.bluealsa` service in the D-Bus system bus, which can be used for accessing
 configured audio devices. In general, BlueALSA acts as a proxy between BlueZ
 and ALSA.
 
-For details of command-line options to `bluealsa`, consult the [bluealsa manual
-page](doc/bluealsa.8.rst).
+The `bluealsad` daemon must be running in order to pair, connect, and use
+remote Bluetooth audio devices. In order to stream audio to e.g. a Bluetooth
+headset, firstly one has to connect the device. If you are not familiar with
+the Bluetooth pairing and connecting procedures on Linux, there is a basic
+guide in the wiki:
+[Bluetooth pairing and connecting](https://github.com/arkq/bluez-alsa/wiki/Bluetooth-Pairing-And-Connecting).
+
+For details of command-line options to `bluealsad`, consult the [bluealsad
+manual page](doc/bluealsad.8.rst).
 
 ### ALSA plug-ins
 
-In order to stream audio to e.g. a Bluetooth headset, firstly one has to
-connect the device. The most straightforward method is to use BlueZ CLI utility
-called `bluetoothctl`. When the device is connected one can use the `bluealsa`
+When a Bluetooth audio device is connected one can use the `bluealsa`
 virtual PCM device with ALSA applications just like any other PCM device:
 
 ```sh
@@ -114,13 +143,14 @@ aplay -D bluealsa:XX:XX:XX:XX:XX:XX, Bourree_in_E_minor.wav
 ```
 
 Please note that this PCM device is based on the [ALSA software PCM I/O
-plug-in][] - it will not be available in the [ALSA Kernel proc interface][].
+plug-in][] - it has no associated sound card, and it will not be available in
+the [ALSA Kernel proc interface][].
 
 [ALSA software PCM I/O plug-in]: https://www.alsa-project.org/alsa-doc/alsa-lib/pcm_external_plugins.html
 [ALSA Kernel proc interface]: https://www.kernel.org/doc/html/latest/sound/designs/procfile.html
 
-Setup parameters of the bluealsa PCM device can be set in the local `.asoundrc`
-configuration file like this:
+Setup parameters of the `bluealsa` PCM device can be set in the local
+`.asoundrc` configuration file like this:
 
 ```sh
 cat ~/.asoundrc
@@ -170,7 +200,7 @@ For full details of the BlueALSA ALSA PCM device and mixer device consult the
 There are also a number of articles on the [bluez-alsa project wiki][] giving
 more examples of using these plug-ins.
 
-[bluez-alsa project wiki]: https://github.com/Arkq/bluez-alsa/wiki
+[bluez-alsa project wiki]: https://github.com/arkq/bluez-alsa/wiki
 
 For more advanced ALSA configuration, consult the [asoundrc on-line
 documentation][] provided by the AlsaProject wiki page.
@@ -196,94 +226,40 @@ articles on the [bluez-alsa project wiki][] giving examples of its use.
 
 The list of available BlueALSA PCMs (provided by connected Bluetooth devices
 with audio capabilities) can be obtained directly from [BlueALSA D-Bus
-API](doc/bluealsa-api.txt) or using `bluealsa-aplay` as a convenient wrapper as
-follows:
+API](doc/org.bluealsa.PCM1.7.rst) or using `bluealsa-aplay` as a convenient
+wrapper as follows:
 
 ```sh
 bluealsa-aplay -L
 ```
 
-## Troubleshooting
-
-1. Using BlueALSA alongside PulseAudio or PipeWire.
-
-   Due to BlueZ limitations, only one program can register as provider of
-   Bluetooth audio profile implementation. So it is not possible to use
-   BlueALSA if either PulseAudio or PipeWire are also running with their own
-   Bluetooth modules enabled; it is first necessary to disable Bluetooth in
-   those applications.
-
-2. ALSA thread-safe API (alsa-lib >= 1.1.2, <= 1.1.3).
-
-   ALSA library versions 1.1.2 and 1.1.3 had a bug in their thread-safe API
-   functions. This bug does not affect hardware audio devices, but it affects
-   many software plug-ins. Random deadlocks are inevitable. The best advice is
-   to use a more recent alsa-lib release, or if that is not possible then
-   disable the thread locking code via an environment variable, as follows:
-   `export LIBASOUND_THREAD_SAFE=0`.
-
-3. Couldn't acquire D-Bus name: org.bluealsa
-
-   It is not possible to run more than one instance of the BlueALSA server per
-   D-Bus interface. If one tries to run second instance, it will fail with the
-   `"Couldn't acquire D-Bus name: org.bluealsa"` error message. This message
-   might also appear when D-Bus policy does not allow acquiring "org.bluealsa"
-   name for a particular user - by default only root is allowed to start
-   BlueALSA server.
-
-4. Couldn't get BlueALSA PCM: PCM not found
-
-   In contrast to standard ALSA sound cards, BlueALSA does not expose all PCMs
-   right away. In the first place it is required to connect remote Bluetooth
-   device with desired Bluetooth profile - run `bluealsa --help` for the list
-   of available profiles. For querying currently connected audio profiles (and
-   connected devices), run `bluealsa-aplay --list-devices`. The common
-   misconception is an attempt to use A2DP playback device as a capture one in
-   case where A2DP is not listed in the "List of CAPTURE Bluetooth Devices"
-   section.
-
-   Additionally, the cause of the "PCM not found" error might be an incorrect
-   ALSA PCM name. Run `bluealsa-aplay --list-pcms` for the list of currently
-   available ALSA PCM names - it might give you a hint what is wrong with your
-   `.asoundrc` entry. Also, take a look at the [bluealsa-plugins manual
-   page](doc/bluealsa-plugins.7.rst).
-
 ## Contributing
 
-This project welcomes contributions of code, documentation and testing. For
-code and manual page contributions, please use GitHub Pull Requests. There is
-no strict policy for PRs, each contribution will be evaluated individually. If
-you wish to help by testing PRs or by making review comments please do so by
-adding comments to the PR.
+This project welcomes contributions of code, documentation and testing.
 
-When preparing a pull request, if possible please configure with
-`--enable-test`, and to catch as many coding errors as possible please compile
-with:
-
-```sh
-make CFLAGS="-Wall -Wextra -Werror"
-```
-
-and then run the unit test suite:
-
-```sh
-make check
-```
-
-The project wiki is "public" and contributions there are also welcome.
+Please see the [CONTRIBUTING](CONTRIBUTING.md) guide for details.
 
 ## Bug reports, feature requests, and requests for help
 
-Before raising a new issue, please search previous issues (both open and
-closed), to see if your question has already been answered or problem resolved.
-If reporting a problem, please clearly state the version of BlueALSA that you
-are using, and give sufficient information for readers to be able to reproduce
-the issue.
+The most commonly encountered errors are discussed in the
+[TROUBLESHOOTING] guide. Please check that file to see if there is already a
+solution for your issue.
 
-Please also look at the [wiki](https://github.com/Arkq/bluez-alsa/wiki) if you
-require help as there is a great deal of useful information. Unfortunately the
-wiki is not indexed by web search engines, so searching on-line for your issue
-will not discover the information in there.
+If you are unable to find a solution in that document or by reading the
+[manual pages][], then please search [previous issues][] (both open and
+closed), and consult the [wiki][] before raising a new issue. Unfortunately
+the wiki is not indexed by web search engines, so searching on-line for your
+issue will not discover the information in there.
+
+If reporting a problem as a new issue, please use the appropriate
+[bluez-alsa GitHub issue reporting template][] and complete each section of
+the template as fully as possible.
+
+[TROUBLESHOOTING]: TROUBLESHOOTING.md
+[manual pages]: doc/
+[previous issues]: https://github.com/arkq/bluez-alsa/issues
+[wiki]: https://github.com/arkq/bluez-alsa/wiki
+[bluez-alsa GitHub issue reporting template]: https://github.com/arkq/bluez-alsa/issues/new/choose
 
 ## License
 
@@ -293,7 +269,8 @@ file](LICENSE) for details.
 ## Resources
 
 1. [Bluetooth Adopted Specifications](https://www.bluetooth.com/specifications/adopted-specifications)
-2. [Bluetooth Design Guidelines](https://developer.apple.com/hardwaredrivers/BluetoothDesignGuidelines.pdf)
-3. [RTP Payload Format for MPEG-4](https://tools.ietf.org/html/rfc6416)
-4. [Coding of MPEG-4 Audio](https://www.iso.org/standard/42739.html)
-5. [ALSA project library reference](https://www.alsa-project.org/alsa-doc/alsa-lib/index.html)
+1. [Bluetooth LE MIDI Specification](https://www.midi.org/specifications-old/item/bluetooth-le-midi)
+1. [Bluetooth Design Guidelines](https://developer.apple.com/hardwaredrivers/BluetoothDesignGuidelines.pdf)
+1. [RTP Payload Format for MPEG-4](https://tools.ietf.org/html/rfc6416)
+1. [Coding of MPEG-4 Audio](https://www.iso.org/standard/42739.html)
+1. [ALSA project library reference](https://www.alsa-project.org/alsa-doc/alsa-lib/index.html)

@@ -1,6 +1,6 @@
 /*
  * BlueALSA - codec-sbc.c
- * Copyright (c) 2016-2021 Arkadiusz Bokowy
+ * Copyright (c) 2016-2023 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -9,6 +9,7 @@
  */
 
 #include "codec-sbc.h"
+/* IWYU pragma: no_include "config.h" */
 
 #include <errno.h>
 #include <stdbool.h>
@@ -60,7 +61,7 @@ uint8_t sbc_a2dp_get_bitpool(const a2dp_sbc_t *conf, unsigned int quality) {
 			quality == SBC_QUALITY_XQPLUS) {
 		/* Check whether XQ/XQ+ is possible. If not,
 		 * downgrade to high quality. */
-		if (conf->frequency == SBC_SAMPLING_FREQ_44100 &&
+		if (conf->sampling_freq == SBC_SAMPLING_FREQ_44100 &&
 				conf->channel_mode == SBC_CHANNEL_MODE_DUAL_CHANNEL &&
 				conf->block_length == SBC_BLOCK_LENGTH_16 &&
 				conf->subbands == SBC_SUBBANDS_8 &&
@@ -74,7 +75,7 @@ uint8_t sbc_a2dp_get_bitpool(const a2dp_sbc_t *conf, unsigned int quality) {
 	}
 
 	if (quality < SBC_QUALITY_XQ)
-		switch (conf->frequency) {
+		switch (conf->sampling_freq) {
 		case SBC_SAMPLING_FREQ_16000:
 		case SBC_SAMPLING_FREQ_32000:
 			bitpool = bitpool_stereo_44100[quality];
@@ -109,6 +110,61 @@ uint8_t sbc_a2dp_get_bitpool(const a2dp_sbc_t *conf, unsigned int quality) {
 }
 
 #if ENABLE_FASTSTREAM
+
+static int sbc_set_a2dp_faststream(sbc_t *sbc,
+		const void *conf, size_t size, bool voice) {
+
+	const a2dp_faststream_t *a2dp = conf;
+	if (size != sizeof(*a2dp))
+		return -EINVAL;
+
+	sbc->blocks = SBC_BLK_16;
+	sbc->subbands = SBC_SB_8;
+	sbc->allocation = SBC_AM_LOUDNESS;
+	/* ensure libsbc uses little-endian PCM on all architectures */
+	sbc->endian = SBC_LE;
+
+	if (voice) {
+
+		if (!(a2dp->direction & FASTSTREAM_DIRECTION_VOICE))
+			return -EINVAL;
+
+		switch (a2dp->sampling_freq_voice) {
+		case FASTSTREAM_SAMPLING_FREQ_VOICE_16000:
+			sbc->frequency = SBC_FREQ_16000;
+			break;
+		default:
+			return -EINVAL;
+		}
+
+		sbc->mode = SBC_MODE_MONO;
+		sbc->bitpool = 32;
+
+	}
+	else {
+
+		if (!(a2dp->direction & FASTSTREAM_DIRECTION_MUSIC))
+			return -EINVAL;
+
+		switch (a2dp->sampling_freq_music) {
+		case FASTSTREAM_SAMPLING_FREQ_MUSIC_44100:
+			sbc->frequency = SBC_FREQ_44100;
+			break;
+		case FASTSTREAM_SAMPLING_FREQ_MUSIC_48000:
+			sbc->frequency = SBC_FREQ_48000;
+			break;
+		default:
+			return -EINVAL;
+		}
+
+		sbc->mode = SBC_MODE_JOINT_STEREO;
+		sbc->bitpool = 29;
+
+	}
+
+	return 0;
+}
+
 /**
  * Initialize SBC audio codec for A2DP FastStream connection.
  *
@@ -122,62 +178,36 @@ uint8_t sbc_a2dp_get_bitpool(const a2dp_sbc_t *conf, unsigned int quality) {
 int sbc_init_a2dp_faststream(sbc_t *sbc, unsigned long flags,
 		const void *conf, size_t size, bool voice) {
 
-	const a2dp_faststream_t *a2dp = conf;
-	if (size != sizeof(*a2dp))
-		return -EINVAL;
-
 	int rv;
 	if ((rv = sbc_init(sbc, flags)) != 0)
 		return rv;
 
-	sbc->blocks = SBC_BLK_16;
-	sbc->subbands = SBC_SB_8;
-	sbc->allocation = SBC_AM_LOUDNESS;
-
-	if (voice) {
-
-		if (!(a2dp->direction & FASTSTREAM_DIRECTION_VOICE))
-			goto fail;
-
-		switch (a2dp->frequency_voice) {
-		case FASTSTREAM_SAMPLING_FREQ_VOICE_16000:
-			sbc->frequency = SBC_FREQ_16000;
-			break;
-		default:
-			goto fail;
-		}
-
-		sbc->mode = SBC_MODE_MONO;
-		sbc->bitpool = 32;
-
-	}
-	else {
-
-		if (!(a2dp->direction & FASTSTREAM_DIRECTION_MUSIC))
-			goto fail;
-
-		switch (a2dp->frequency_music) {
-		case FASTSTREAM_SAMPLING_FREQ_MUSIC_44100:
-			sbc->frequency = SBC_FREQ_44100;
-			break;
-		case FASTSTREAM_SAMPLING_FREQ_MUSIC_48000:
-			sbc->frequency = SBC_FREQ_48000;
-			break;
-		default:
-			goto fail;
-		}
-
-		sbc->mode = SBC_MODE_JOINT_STEREO;
-		sbc->bitpool = 29;
-
+	if ((rv = sbc_set_a2dp_faststream(sbc, conf, size, voice)) != 0) {
+		sbc_finish(sbc);
+		return rv;
 	}
 
 	return 0;
-
-fail:
-	sbc_finish(sbc);
-	return -EINVAL;
 }
+
+/**
+ * Reinitialize SBC audio codec for A2DP FastStream connection.
+ *
+ * @param sbc SBC structure which shall be reinitialized.
+ * @param flags SBC initialization flags.
+ * @param conf A2DP FastStream configuration blob.
+ * @param size Size of the configuration blob.
+ * @param voice It true, SBC will be initialized for voice direction.
+ * @return This function returns 0 on success or a negative error value
+ *   in case of SBC audio codec initialization failure. */
+int sbc_reinit_a2dp_faststream(sbc_t *sbc, unsigned long flags,
+		const void *conf, size_t size, bool voice) {
+	int rv;
+	if ((rv = sbc_reinit(sbc, flags)) != 0)
+		return rv;
+	return sbc_set_a2dp_faststream(sbc, conf, size, voice);
+}
+
 #endif
 
 #if ENABLE_MSBC
@@ -225,14 +255,28 @@ const char *sbc_strerror(int err) {
 #if DEBUG
 void sbc_print_internals(const sbc_t *sbc) {
 
-	const char *mode[] = { "Mono", "DualChannel", "Stereo", "JointStereo" };
-	const char *allocation[] = { "SNR", "Loudness" };
-	const unsigned int frequency[] = { 16000, 32000, 44100, 48000 };
-	const unsigned int br = 8 * sbc_get_frame_length((sbc_t *)sbc) * frequency[sbc->frequency] /
+	static const char *mode[] = {
+		[SBC_MODE_MONO] = "Mono",
+		[SBC_MODE_DUAL_CHANNEL] = "DualChannel",
+		[SBC_MODE_STEREO] = "Stereo",
+		[SBC_MODE_JOINT_STEREO] = "JointStereo",
+	};
+	static const char *allocation[] = {
+		[SBC_AM_LOUDNESS] = "Loudness",
+		[SBC_AM_SNR] = "SNR",
+	};
+	static const unsigned int rate[] = {
+		[SBC_SAMPLING_FREQ_16000] = 16000,
+		[SBC_SAMPLING_FREQ_32000] = 32000,
+		[SBC_SAMPLING_FREQ_44100] = 44100,
+		[SBC_SAMPLING_FREQ_48000] = 48000,
+	};
+
+	const unsigned int br = 8 * sbc_get_frame_length((sbc_t *)sbc) * rate[sbc->frequency] /
 		((sbc->subbands + 1) * 4) / ((sbc->blocks + 1) * 4);
 
 	debug("SBC setup: %u Hz %s allocation=%s blocks=%u sub-bands=%u bit-pool=%u => %u bps",
-			frequency[sbc->frequency],
+			rate[sbc->frequency],
 			mode[sbc->mode],
 			allocation[sbc->allocation],
 			(sbc->blocks + 1) * 4,

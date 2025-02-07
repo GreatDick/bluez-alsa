@@ -1,6 +1,6 @@
 /*
  * BlueALSA - main.c
- * Copyright (c) 2016-2022 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -13,13 +13,15 @@
 #endif
 
 #include <getopt.h>
+#include <libgen.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <strings.h>
+#include <syslog.h>
 #include <time.h>
 
 #include <gio/gio.h>
@@ -30,11 +32,15 @@
 # include <ldacBT.h>
 #endif
 
+#if ENABLE_LHDC
+# include <lhdcBT.h>
+# include <lhdcBT_dec.h>
+#endif
+
 #include "a2dp.h"
 #include "a2dp-sbc.h"
 #include "audio.h"
-#include "ba-adapter.h"
-#include "bluealsa-config.h"
+#include "ba-config.h"
 #include "bluealsa-dbus.h"
 #include "bluealsa-iface.h"
 #include "bluez.h"
@@ -63,27 +69,27 @@
 static bool dbus_name_acquired = false;
 static int retval = EXIT_SUCCESS;
 
-static char *get_a2dp_codecs(enum a2dp_dir dir) {
+static char *get_a2dp_codecs(enum a2dp_type type) {
 
 	const char *strv[16 + 1] = { NULL };
 	size_t n = 0;
 
-	const struct a2dp_codec * a2dp_codecs_tmp[16];
-	struct a2dp_codec * const * cc = a2dp_codecs;
-	for (const struct a2dp_codec *c = *cc; c != NULL; c = *++cc) {
-		if (c->dir != dir)
+	const struct a2dp_sep * a2dp_seps_tmp[16];
+	struct a2dp_sep * const * seps = a2dp_seps;
+	for (const struct a2dp_sep *sep = *seps; sep != NULL; sep = *++seps) {
+		if (sep->config.type != type)
 			continue;
-		a2dp_codecs_tmp[n] = c;
-		if (++n >= ARRAYSIZE(a2dp_codecs_tmp))
+		a2dp_seps_tmp[n] = sep;
+		if (++n >= ARRAYSIZE(a2dp_seps_tmp))
 			break;
 	}
 
 	/* Sort A2DP codecs before displaying them. */
-	qsort(a2dp_codecs_tmp, n, sizeof(*a2dp_codecs_tmp),
-			QSORT_COMPAR(a2dp_codec_ptr_cmp));
+	qsort(a2dp_seps_tmp, n, sizeof(*a2dp_seps_tmp),
+			QSORT_COMPAR(a2dp_sep_ptr_cmp));
 
 	for (size_t i = 0; i < n; i++)
-		strv[i] = a2dp_codecs_codec_id_to_string(a2dp_codecs_tmp[i]->codec_id);
+		strv[i] = a2dp_codecs_codec_id_to_string(a2dp_seps_tmp[i]->config.codec_id);
 
 	return g_strjoinv(", ", (char **)strv);
 }
@@ -94,6 +100,9 @@ static char *get_hfp_codecs(void) {
 		hfp_codec_id_to_string(HFP_CODEC_CVSD),
 #if ENABLE_MSBC
 		hfp_codec_id_to_string(HFP_CODEC_MSBC),
+#endif
+#if ENABLE_LC3_SWB
+		hfp_codec_id_to_string(HFP_CODEC_LC3_SWB),
 #endif
 		NULL,
 	};
@@ -145,20 +154,23 @@ static void g_bus_name_lost(GDBusConnection *conn, const char *name, void *userd
 int main(int argc, char **argv) {
 
 	int opt;
-	const char *opts = "hVB:Si:p:c:";
-	const struct option longopts[] = {
+	static const char *opts = "hVSB:i:p:c:";
+	static const struct option longopts[] = {
 		{ "help", no_argument, NULL, 'h' },
 		{ "version", no_argument, NULL, 'V' },
-		{ "dbus", required_argument, NULL, 'B' },
 		{ "syslog", no_argument, NULL, 'S' },
+		{ "loglevel", required_argument, NULL, 23 },
+		{ "dbus", required_argument, NULL, 'B' },
 		{ "device", required_argument, NULL, 'i' },
 		{ "profile", required_argument, NULL, 'p' },
 		{ "codec", required_argument, NULL, 'c' },
+		{ "all-codecs", no_argument, NULL, 25 },
 		{ "initial-volume", required_argument, NULL, 17 },
 		{ "keep-alive", required_argument, NULL, 8 },
+		{ "io-rt-priority", required_argument, NULL, 3 },
+		{ "disable-realtek-usb-fix", no_argument, NULL, 21 },
 		{ "a2dp-force-mono", no_argument, NULL, 6 },
 		{ "a2dp-force-audio-cd", no_argument, NULL, 7 },
-		{ "a2dp-volume", no_argument, NULL, 9 },
 		{ "sbc-quality", required_argument, NULL, 14 },
 #if ENABLE_AAC
 		{ "aac-afterburner", no_argument, NULL, 4 },
@@ -174,12 +186,32 @@ int main(int argc, char **argv) {
 		{ "ldac-abr", no_argument, NULL, 10 },
 		{ "ldac-quality", required_argument, NULL, 11 },
 #endif
+#if ENABLE_LHDC
+		// TODO: LLAC/V3/V4, bit depth, sample frequency, LLAC bitrate
+		{ "lhdc-quality", required_argument, NULL, 24 },
+#endif
 #if ENABLE_MP3LAME
 		{ "mp3-algorithm", required_argument, NULL, 12 },
 		{ "mp3-vbr-quality", required_argument, NULL, 13 },
 #endif
+#if ENABLE_MIDI
+		{ "midi-advertisement", no_argument, NULL, 22 },
+#endif
 		{ "xapl-resp-name", required_argument, NULL, 16 },
 		{ 0, 0, 0, 0 },
+	};
+
+	static const struct {
+		uint32_t codec_id;
+		bool *ptr;
+	} hfp_codecs[] = {
+		{ HFP_CODEC_CVSD, &config.hfp.codecs.cvsd },
+#if ENABLE_MSBC
+		{ HFP_CODEC_MSBC, &config.hfp.codecs.msbc },
+#endif
+#if ENABLE_LC3_SWB
+		{ HFP_CODEC_LC3_SWB, &config.hfp.codecs.lc3_swb },
+#endif
 	};
 
 	bool syslog = false;
@@ -191,39 +223,25 @@ int main(int argc, char **argv) {
 	opterr = 0;
 	while ((opt = getopt_long(argc, argv, opts, longopts, NULL)) != -1)
 		switch (opt) {
-		case 'S' /* --syslog */ :
-			syslog = true;
-			break;
-		}
-
-	log_open(argv[0], syslog);
-
-	if (bluealsa_config_init() != 0) {
-		error("Couldn't initialize bluealsa config");
-		return EXIT_FAILURE;
-	}
-
-	/* parse options */
-	optind = 0; opterr = 1;
-	while ((opt = getopt_long(argc, argv, opts, longopts, NULL)) != -1)
-		switch (opt) {
-
 		case 'h' /* --help */ :
 			printf("Usage:\n"
 					"  %s -p PROFILE [OPTION]...\n"
 					"\nOptions:\n"
 					"  -h, --help\t\t\tprint this help and exit\n"
 					"  -V, --version\t\t\tprint version and exit\n"
-					"  -B, --dbus=NAME\t\tD-Bus service name suffix\n"
 					"  -S, --syslog\t\t\tsend output to syslog\n"
+					"  --loglevel=LEVEL\t\tminimum message priority\n"
+					"  -B, --dbus=NAME\t\tD-Bus service name suffix\n"
 					"  -i, --device=hciX\t\tHCI device(s) to use\n"
 					"  -p, --profile=NAME\t\tset enabled BT profiles\n"
 					"  -c, --codec=NAME\t\tset enabled BT audio codecs\n"
+					"  --all-codecs\t\t\tenable all available BT audio codecs\n"
 					"  --initial-volume=NUM\t\tinitial volume level [0-100]\n"
 					"  --keep-alive=SEC\t\tkeep Bluetooth transport alive\n"
+					"  --io-rt-priority=NUM\t\treal-time priority for IO threads\n"
+					"  --disable-realtek-usb-fix\tdisable fix for mSBC on Realtek USB\n"
 					"  --a2dp-force-mono\t\ttry to force monophonic sound\n"
 					"  --a2dp-force-audio-cd\t\ttry to force 44.1 kHz sampling\n"
-					"  --a2dp-volume\t\t\tnative volume control by default\n"
 					"  --sbc-quality=MODE\t\tset SBC encoder quality mode\n"
 #if ENABLE_AAC
 					"  --aac-afterburner\t\tenable FDK AAC afterburner\n"
@@ -239,21 +257,30 @@ int main(int argc, char **argv) {
 					"  --ldac-abr\t\t\tenable LDAC adaptive bit rate\n"
 					"  --ldac-quality=MODE\t\tset LDAC encoder quality mode\n"
 #endif
+#if ENABLE_LHDC
+					"  --lhdc-quality=MODE\t\tset LHDC encoder quality mode\n"
+#endif
 #if ENABLE_MP3LAME
 					"  --mp3-algorithm=TYPE\t\tselect LAME encoder algorithm type\n"
 					"  --mp3-vbr-quality=MODE\tset LAME encoder VBR quality mode\n"
 #endif
+#if ENABLE_MIDI
+					"  --midi-advertisement\t\tenable LE advertisement for BLE-MIDI\n"
+#endif
 					"  --xapl-resp-name=NAME\t\tset product name used by XAPL\n"
 					"\nAvailable BT profiles:\n"
-					"  - a2dp-source\tAdvanced Audio Source (%s)\n"
-					"  - a2dp-sink\tAdvanced Audio Sink (%s)\n"
+					"  - a2dp-source\tAdvanced Audio Source (v1.4)\n"
+					"  - a2dp-sink\tAdvanced Audio Sink (v1.4)\n"
 #if ENABLE_OFONO
 					"  - hfp-ofono\tHands-Free AG/HF handled by oFono\n"
 #endif
-					"  - hfp-ag\tHands-Free Audio Gateway (%s)\n"
-					"  - hfp-hf\tHands-Free (%s)\n"
-					"  - hsp-ag\tHeadset Audio Gateway (%s)\n"
-					"  - hsp-hs\tHeadset (%s)\n"
+					"  - hfp-ag\tHands-Free Audio Gateway (v1.9)\n"
+					"  - hfp-hf\tHands-Free (v1.9)\n"
+					"  - hsp-ag\tHeadset Audio Gateway (v1.2)\n"
+					"  - hsp-hs\tHeadset (v1.2)\n"
+#if ENABLE_MIDI
+					"  - midi\tBluetooth LE MIDI (v1.0)\n"
+#endif
 					"\n"
 					"Available BT audio codecs:\n"
 					"  a2dp-source:\t%s\n"
@@ -261,9 +288,6 @@ int main(int argc, char **argv) {
 					"  hfp-*:\t%s\n"
 					"",
 					argv[0],
-					"v1.3", "v1.3",
-					"v1.7", "v1.7",
-					"v1.2", "v1.2",
 					get_a2dp_codecs(A2DP_SOURCE),
 					get_a2dp_codecs(A2DP_SINK),
 					get_hfp_codecs());
@@ -273,15 +297,55 @@ int main(int argc, char **argv) {
 			printf("%s\n", PACKAGE_VERSION);
 			return EXIT_SUCCESS;
 
+		case 'S' /* --syslog */ :
+			syslog = true;
+			break;
+		}
+
+	log_open(basename(argv[0]), syslog);
+
+	if (ba_config_init() != 0) {
+		error("Couldn't initialize configuration");
+		return EXIT_FAILURE;
+	}
+
+	/* parse options */
+	optind = 0; opterr = 1;
+	while ((opt = getopt_long(argc, argv, opts, longopts, NULL)) != -1)
+		switch (opt) {
+		case 'h' /* --help */ :
+		case 'V' /* --version */ :
+		case 'S' /* --syslog */ :
+			break;
+
+		case 23 /* --loglevel=LEVEL */ : {
+
+			static const nv_entry_t values[] = {
+				{ "error", .v.ui = LOG_ERR },
+				{ "warning", .v.ui = LOG_WARNING },
+				{ "info", .v.ui = LOG_INFO },
+#if DEBUG
+				{ "debug", .v.ui = LOG_DEBUG },
+#endif
+				{ 0 },
+			};
+
+			const nv_entry_t *entry;
+			if ((entry = nv_find(values, optarg)) == NULL) {
+				error("Invalid loglevel {%s}: %s", nv_join_names(values), optarg);
+				return EXIT_FAILURE;
+			}
+
+			log_set_min_priority(entry->v.ui);
+			break;
+		}
+
 		case 'B' /* --dbus=NAME */ :
 			snprintf(dbus_service, sizeof(dbus_service), BLUEALSA_SERVICE ".%s", optarg);
 			if (!g_dbus_is_name(dbus_service)) {
 				error("Invalid BlueALSA D-Bus service name: %s", dbus_service);
 				return EXIT_FAILURE;
 			}
-			break;
-
-		case 'S' /* --syslog */ :
 			break;
 
 		case 'i' /* --device=HCI */ :
@@ -303,6 +367,9 @@ int main(int argc, char **argv) {
 				{ "hfp-ag", &config.profile.hfp_ag },
 				{ "hsp-hs", &config.profile.hsp_hs },
 				{ "hsp-ag", &config.profile.hsp_ag },
+#if ENABLE_MIDI
+				{ "midi", &config.profile.midi },
+#endif
 			};
 
 			bool matched = false;
@@ -323,16 +390,6 @@ int main(int argc, char **argv) {
 
 		case 'c' /* --codec=NAME */ : {
 
-			static const struct {
-				uint16_t codec_id;
-				bool *ptr;
-			} hfp_codecs[] = {
-				{ HFP_CODEC_CVSD, &config.hfp.codecs.cvsd },
-#if ENABLE_MSBC
-				{ HFP_CODEC_MSBC, &config.hfp.codecs.msbc },
-#endif
-			};
-
 			bool enable = true;
 			bool matched = false;
 			if (optarg[0] == '+' || optarg[0] == '-') {
@@ -340,11 +397,11 @@ int main(int argc, char **argv) {
 				optarg++;
 			}
 
-			struct a2dp_codec * const * cc = a2dp_codecs;
-			uint16_t codec_id = a2dp_codecs_codec_id_from_string(optarg);
-			for (struct a2dp_codec *c = *cc; c != NULL; c = *++cc)
-				if (c->codec_id == codec_id) {
-					c->enabled = enable;
+			struct a2dp_sep * const * seps = a2dp_seps;
+			uint32_t codec_id = a2dp_codecs_codec_id_from_string(optarg);
+			for (struct a2dp_sep *sep = *seps; sep != NULL; sep = *++seps)
+				if (sep->config.codec_id == codec_id) {
+					sep->enabled = enable;
 					matched = true;
 				}
 
@@ -363,6 +420,15 @@ int main(int argc, char **argv) {
 			break;
 		}
 
+		case 25 /* --all-codecs */ : {
+			struct a2dp_sep * const * seps = a2dp_seps;
+			for (struct a2dp_sep *sep = *seps; sep != NULL; sep = *++seps)
+				sep->enabled = true;
+			for (size_t i = 0; i < ARRAYSIZE(hfp_codecs); i++)
+				*hfp_codecs[i].ptr = true;
+			break;
+		}
+
 		case 17 /* --initial-volume=NUM */ : {
 			unsigned int vol = atoi(optarg);
 			if (vol > 100) {
@@ -378,14 +444,25 @@ int main(int argc, char **argv) {
 			config.keep_alive_time = atof(optarg) * 1000;
 			break;
 
+		case 3 /* --io-rt-priority=NUM */ :
+			config.io_thread_rt_priority = atoi(optarg);
+			const int min = sched_get_priority_min(SCHED_FIFO);
+			const int max = sched_get_priority_max(SCHED_FIFO);
+			if (config.io_thread_rt_priority < min || max < config.io_thread_rt_priority) {
+				error("Invalid IO thread RT priority [%d, %d]: %s", min, max, optarg);
+				return EXIT_FAILURE;
+			}
+			break;
+
+		case 21 /* --disable-realtek-usb-fix */ :
+			config.disable_realtek_usb_fix = true;
+			break;
+
 		case 6 /* --a2dp-force-mono */ :
 			config.a2dp.force_mono = true;
 			break;
 		case 7 /* --a2dp-force-audio-cd */ :
 			config.a2dp.force_44100 = true;
-			break;
-		case 9 /* --a2dp-volume */ :
-			config.a2dp.volume = true;
 			break;
 
 		case 14 /* --sbc-quality=MODE */ : {
@@ -417,13 +494,15 @@ int main(int argc, char **argv) {
 		case 5 /* --aac-bitrate=BPS */ :
 			config.aac_bitrate = atoi(optarg);
 			break;
-		case 15 /* --aac-latm-version=NUM */ :
-			config.aac_latm_version = atoi(optarg);
-			if (config.aac_latm_version > 2) {
-				error("Invalid LATM version [0, 2]: %s", optarg);
+		case 15 /* --aac-latm-version=NUM */ : {
+			char *tmp;
+			config.aac_latm_version = strtoul(optarg, &tmp, 10);
+			if (config.aac_latm_version > 2 || optarg == tmp || *tmp != '\0') {
+				error("Invalid LATM version {0, 1, 2}: %s", optarg);
 				return EXIT_FAILURE;
 			}
 			break;
+		}
 		case 18 /* --aac-true-bps */ :
 			config.aac_true_bps = true;
 			break;
@@ -459,6 +538,34 @@ int main(int argc, char **argv) {
 			}
 
 			config.ldac_eqmid = entry->v.ui;
+			break;
+		}
+#endif
+
+#if ENABLE_LHDC
+		case 24 /* --lhdc-quality=MODE */ : {
+
+			static const nv_entry_t values[] = {
+				{ "low0", .v.ui = LHDCBT_QUALITY_LOW0 },
+				{ "low1", .v.ui = LHDCBT_QUALITY_LOW1 },
+				{ "low2", .v.ui = LHDCBT_QUALITY_LOW2 },
+				{ "low3", .v.ui = LHDCBT_QUALITY_LOW3 },
+				{ "low4", .v.ui = LHDCBT_QUALITY_LOW4 },
+				{ "low",  .v.ui = LHDCBT_QUALITY_LOW  },
+				{ "mid",  .v.ui = LHDCBT_QUALITY_MID  },
+				{ "high", .v.ui = LHDCBT_QUALITY_HIGH },
+				{ "auto", .v.ui = LHDCBT_QUALITY_AUTO },
+				{ 0 },
+			};
+
+			const nv_entry_t *entry;
+			if ((entry = nv_find(values, optarg)) == NULL) {
+				error("Invalid LHDC encoder quality mode {%s}: %s",
+						nv_join_names(values), optarg);
+				return EXIT_FAILURE;
+			}
+
+			config.lhdc_eqmid = entry->v.ui;
 			break;
 		}
 #endif
@@ -508,6 +615,12 @@ int main(int argc, char **argv) {
 		}
 #endif
 
+#if ENABLE_MIDI
+		case 22 /* --midi-advertisement */ :
+			config.midi.advertise = true;
+			break;
+#endif
+
 		case 16 /* --xapl-resp-name=NAME */ :
 			config.hfp.xapl_product_name = optarg;
 			break;
@@ -521,7 +634,7 @@ int main(int argc, char **argv) {
 	if (!(config.profile.a2dp_source || config.profile.a2dp_sink ||
 				config.profile.hfp_hf || config.profile.hfp_ag ||
 				config.profile.hsp_hs || config.profile.hsp_ag ||
-				config.profile.hfp_ofono)) {
+				config.profile.hfp_ofono || config.profile.midi)) {
 		error("It is required to enabled at least one BT profile");
 		fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
 		return EXIT_FAILURE;
@@ -566,9 +679,16 @@ int main(int argc, char **argv) {
 	a2dp_sbc_sink.enabled = true;
 	config.hfp.codecs.cvsd = true;
 
-	a2dp_codecs_init();
+	if (a2dp_seps_init() == -1)
+		return EXIT_FAILURE;
 
-	storage_init(BLUEALSA_STORAGE_DIR);
+	const char *storage_base_dir = BLUEALSA_STORAGE_DIR;
+#if ENABLE_SYSTEMD
+	const char *systemd_state_dir;
+	if ((systemd_state_dir = getenv("STATE_DIRECTORY")) != NULL)
+		storage_base_dir = systemd_state_dir;
+#endif
+	storage_init(storage_base_dir);
 
 	/* In order to receive EPIPE while writing to the pipe whose reading end
 	 * is closed, the SIGPIPE signal has to be handled. For more information
@@ -590,8 +710,12 @@ int main(int argc, char **argv) {
 	g_main_loop_run(loop);
 
 	/* cleanup internal structures */
-	for (size_t i = 0; i < ARRAYSIZE(config.adapters); i++)
-		ba_adapter_destroy(config.adapters[i]);
+	bluez_destroy();
+
+	storage_destroy();
+	g_dbus_connection_close_sync(config.dbus, NULL, NULL);
+	g_main_loop_unref(loop);
+	g_free(address);
 
 	return retval;
 }

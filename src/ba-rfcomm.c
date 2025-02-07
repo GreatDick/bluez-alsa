@@ -1,6 +1,6 @@
 /*
  * BlueALSA - ba-rfcomm.c
- * Copyright (c) 2016-2022 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -10,9 +10,14 @@
 
 #include "ba-rfcomm.h"
 
+#if HAVE_CONFIG_H
+# include <config.h>
+#endif
+
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,12 +28,12 @@
 #include <glib.h>
 
 #include "ba-adapter.h"
+#include "ba-config.h"
 #include "ba-device.h"
 #include "ba-transport.h"
-#include "bluealsa-config.h"
+#include "ba-transport-pcm.h"
 #include "bluealsa-dbus.h"
 #include "bluez.h"
-#include "utils.h"
 #include "shared/defs.h"
 #include "shared/log.h"
 
@@ -125,8 +130,20 @@ retry:
  * HFP set state wrapper for debugging purposes. */
 static void rfcomm_set_hfp_state(struct ba_rfcomm *r, enum hfp_slc_state state) {
 	debug("RFCOMM: %s state transition: %d -> %d",
-			ba_transport_type_to_string(r->sco->type), r->state, state);
+			ba_transport_debug_name(r->sco), r->state, state);
 	r->state = state;
+}
+
+/**
+ * Finalize HFP codec selection - signal other threads. */
+static void rfcomm_finalize_codec_selection(struct ba_rfcomm *r) {
+
+	pthread_mutex_lock(&r->sco->codec_select_client_mtx);
+	r->codec_selection_done = true;
+	pthread_mutex_unlock(&r->sco->codec_select_client_mtx);
+
+	pthread_cond_signal(&r->codec_selection_cond);
+
 }
 
 /**
@@ -155,12 +172,12 @@ static int rfcomm_handler_cind_test_cb(struct ba_rfcomm *r, const struct bt_at *
 	/* NOTE: The order of indicators in the CIND response message
 	 *       has to be consistent with the hfp_ind enumeration. */
 	if (rfcomm_write_at(fd, AT_TYPE_RESP, "+CIND",
-				"(\"service\",(0-1))"
+				"(\"service\",(0,1))"
 				",(\"call\",(0,1))"
 				",(\"callsetup\",(0-3))"
 				",(\"callheld\",(0-2))"
 				",(\"signal\",(0-5))"
-				",(\"roam\",(0-1))"
+				",(\"roam\",(0,1))"
 				",(\"battchg\",(0-5))"
 			) == -1)
 		return -1;
@@ -198,7 +215,7 @@ static int rfcomm_handler_cind_get_cb(struct ba_rfcomm *r, const struct bt_at *a
  * RESP: Standard indicator update AT command */
 static int rfcomm_handler_cind_resp_test_cb(struct ba_rfcomm *r, const struct bt_at *at) {
 	/* parse response for the +CIND TEST command */
-	if (at_parse_cind(at->value, r->hfp_ind_map) == -1)
+	if (at_parse_get_cind(at->value, r->hfp_ind_map) == -1)
 		warn("Couldn't parse AG indicators: %s", at->value);
 	if (r->state < HFP_SLC_CIND_TEST)
 		rfcomm_set_hfp_state(r, HFP_SLC_CIND_TEST);
@@ -211,10 +228,9 @@ static int rfcomm_handler_cind_resp_get_cb(struct ba_rfcomm *r, const struct bt_
 
 	struct ba_device * const d = r->sco->d;
 	char *tmp = at->value;
-	size_t i;
 
 	/* parse response for the +CIND GET command */
-	for (i = 0; i < ARRAYSIZE(r->hfp_ind_map); i++) {
+	for (size_t i = 0; i < ARRAYSIZE(r->hfp_ind_map); i++) {
 		r->hfp_ind[r->hfp_ind_map[i]] = atoi(tmp);
 		if (r->hfp_ind_map[i] == HFP_IND_BATTCHG) {
 			d->battery.charge = atoi(tmp) * 100 / 5;
@@ -240,7 +256,7 @@ static int rfcomm_handler_cmer_set_cb(struct ba_rfcomm *r, const struct bt_at *a
 	const int fd = r->fd;
 	const char *resp = "OK";
 
-	if (at_parse_cmer(at->value, r->hfp_cmer) == -1) {
+	if (at_parse_set_cmer(at->value, r->hfp_cmer) == -1) {
 		warn("Couldn't parse CMER setup: %s", at->value);
 		resp = "ERROR";
 	}
@@ -286,7 +302,7 @@ static int rfcomm_handler_bia_set_cb(struct ba_rfcomm *r, const struct bt_at *at
 	const int fd = r->fd;
 	const char *resp = "OK";
 
-	if (at_parse_bia(at->value, r->hfp_ind_state) == -1) {
+	if (at_parse_set_bia(at->value, r->hfp_ind_state) == -1) {
 		warn("Couldn't parse BIA indicators activation: %s", at->value);
 		resp = "ERROR";
 	}
@@ -296,6 +312,30 @@ static int rfcomm_handler_bia_set_cb(struct ba_rfcomm *r, const struct bt_at *at
 	return 0;
 }
 
+#if !DEBUG
+# define debug_ag_features(features)
+#else
+static void debug_ag_features(uint32_t features) {
+	const char *names[32] = { NULL };
+	hfp_ag_features_to_strings(features, names, ARRAYSIZE(names));
+	char *tmp = g_strjoinv(", ", (char **)names);
+	debug("AG features [%u]: %s", features, tmp);
+	g_free(tmp);
+}
+#endif
+
+#if !DEBUG
+# define debug_hf_features(features)
+#else
+static void debug_hf_features(uint32_t features) {
+	const char *names[32] = { NULL };
+	hfp_hf_features_to_strings(features, names, ARRAYSIZE(names));
+	char *tmp = g_strjoinv(", ", (char **)names);
+	debug("HF features [%u]: %s", features, tmp);
+	g_free(tmp);
+}
+#endif
+
 /**
  * SET: Bluetooth Retrieve Supported Features */
 static int rfcomm_handler_brsf_set_cb(struct ba_rfcomm *r, const struct bt_at *at) {
@@ -304,14 +344,37 @@ static int rfcomm_handler_brsf_set_cb(struct ba_rfcomm *r, const struct bt_at *a
 	const int fd = r->fd;
 	char tmp[16];
 
-	r->hfp_features = atoi(at->value);
+	r->hf_features = atoi(at->value);
+
+	debug_ag_features(r->ag_features);
+	debug_hf_features(r->hf_features);
 
 	/* If codec negotiation is not supported in the HF, the AT+BAC
 	 * command will not be sent. So, we can assume default codec. */
-	if (!(r->hfp_features & HFP_HF_FEAT_CODEC))
+	if (!(r->hf_features & HFP_HF_FEAT_CODEC)) {
 		ba_transport_set_codec(t_sco, HFP_CODEC_CVSD);
+		r->hf_codecs.cvsd = true;
+	}
 
-	sprintf(tmp, "%u", ba_adapter_get_hfp_features_ag(t_sco->d->a));
+	/* If codec negotiation is not supported on our side, the AT+BAC
+	 * command will not be sent as well. In that case we will have to
+	 * use some heuristic for determining which codecs are supported. */
+	if (!(r->ag_features & HFP_AG_FEAT_CODEC)) {
+		/* Assume that mandatory codec is supported. */
+		r->hf_codecs.cvsd = true;
+		/* If codec selection is supported assume that
+		 * mSBC and/or LC3-SWB are supported as well. */
+		if (r->hf_features & HFP_HF_FEAT_CODEC) {
+#if ENABLE_MSBC
+			r->hf_codecs.msbc = true;
+#endif
+#if ENABLE_LC3_SWB
+			r->hf_codecs.lc3_swb = true;
+#endif
+		}
+	}
+
+	sprintf(tmp, "%u", r->ag_features);
 	if (rfcomm_write_at(fd, AT_TYPE_RESP, "+BRSF", tmp) == -1)
 		return -1;
 	if (rfcomm_write_at(fd, AT_TYPE_RESP, NULL, "OK") == -1)
@@ -328,11 +391,30 @@ static int rfcomm_handler_brsf_set_cb(struct ba_rfcomm *r, const struct bt_at *a
 static int rfcomm_handler_brsf_resp_cb(struct ba_rfcomm *r, const struct bt_at *at) {
 
 	struct ba_transport * const t_sco = r->sco;
-	r->hfp_features = atoi(at->value);
+
+	r->ag_features = atoi(at->value);
+
+	debug_ag_features(r->ag_features);
+	debug_hf_features(r->hf_features);
 
 	/* codec negotiation is not supported in the AG */
-	if (!(r->hfp_features & HFP_AG_FEAT_CODEC))
+	if (!(r->ag_features & HFP_AG_FEAT_CODEC))
 		ba_transport_set_codec(t_sco, HFP_CODEC_CVSD);
+
+	/* Since CVSD is a mandatory codec,
+	 * we can assume that AG supports it. */
+	r->ag_codecs.cvsd = true;
+
+	/* If codec selection is supported in the AG, we can assume
+	 * that mSBC and/or LC3-SWB are supported as well. */
+	if (r->ag_features & HFP_AG_FEAT_CODEC) {
+#if ENABLE_MSBC
+		r->ag_codecs.msbc = true;
+#endif
+#if ENABLE_LC3_SWB
+		r->ag_codecs.lc3_swb = true;
+#endif
+	}
 
 	if (r->state < HFP_SLC_BRSF_SET)
 		rfcomm_set_hfp_state(r, HFP_SLC_BRSF_SET);
@@ -357,16 +439,20 @@ static int rfcomm_handler_nrec_set_cb(struct ba_rfcomm *r, const struct bt_at *a
 static int rfcomm_handler_vgm_set_cb(struct ba_rfcomm *r, const struct bt_at *at) {
 
 	struct ba_transport * const t_sco = r->sco;
-	struct ba_transport_pcm *pcm = &t_sco->sco.mic_pcm;
+	struct ba_transport_pcm *pcm = &t_sco->sco.pcm_mic;
+	const int gain = r->gain_mic = atoi(at->value);
 	const int fd = r->fd;
 
 	/* skip update in case of software volume */
 	if (pcm->soft_volume)
 		return rfcomm_write_at(fd, AT_TYPE_RESP, NULL, "OK");
 
-	r->gain_mic = atoi(at->value);
-	int level = ba_transport_pcm_volume_bt_to_level(pcm, r->gain_mic);
+	int level = ba_transport_pcm_volume_range_to_level(gain, HFP_VOLUME_GAIN_MAX);
+
+	pthread_mutex_lock(&pcm->mutex);
 	ba_transport_pcm_volume_set(&pcm->volume[0], &level, NULL, NULL);
+	pthread_mutex_unlock(&pcm->mutex);
+
 	bluealsa_dbus_pcm_update(pcm, BA_DBUS_PCM_UPDATE_VOLUME);
 
 	if (rfcomm_write_at(fd, AT_TYPE_RESP, NULL, "OK") == -1)
@@ -379,11 +465,15 @@ static int rfcomm_handler_vgm_set_cb(struct ba_rfcomm *r, const struct bt_at *at
 static int rfcomm_handler_vgm_resp_cb(struct ba_rfcomm *r, const struct bt_at *at) {
 
 	struct ba_transport * const t_sco = r->sco;
-	struct ba_transport_pcm *pcm = &t_sco->sco.mic_pcm;
+	struct ba_transport_pcm *pcm = &t_sco->sco.pcm_mic;
 
-	r->gain_mic = atoi(at->value);
-	int level = ba_transport_pcm_volume_bt_to_level(pcm, r->gain_mic);
+	int gain = r->gain_mic = atoi(at->value);
+	int level = ba_transport_pcm_volume_range_to_level(gain, HFP_VOLUME_GAIN_MAX);
+
+	pthread_mutex_lock(&pcm->mutex);
 	ba_transport_pcm_volume_set(&pcm->volume[0], &level, NULL, NULL);
+	pthread_mutex_unlock(&pcm->mutex);
+
 	bluealsa_dbus_pcm_update(pcm, BA_DBUS_PCM_UPDATE_VOLUME);
 
 	return 0;
@@ -394,16 +484,20 @@ static int rfcomm_handler_vgm_resp_cb(struct ba_rfcomm *r, const struct bt_at *a
 static int rfcomm_handler_vgs_set_cb(struct ba_rfcomm *r, const struct bt_at *at) {
 
 	struct ba_transport * const t_sco = r->sco;
-	struct ba_transport_pcm *pcm = &t_sco->sco.spk_pcm;
+	struct ba_transport_pcm *pcm = &t_sco->sco.pcm_spk;
+	const int gain = r->gain_spk = atoi(at->value);
 	const int fd = r->fd;
 
 	/* skip update in case of software volume */
 	if (pcm->soft_volume)
 		return rfcomm_write_at(fd, AT_TYPE_RESP, NULL, "OK");
 
-	r->gain_spk = atoi(at->value);
-	int level = ba_transport_pcm_volume_bt_to_level(pcm, r->gain_spk);
+	int level = ba_transport_pcm_volume_range_to_level(gain, HFP_VOLUME_GAIN_MAX);
+
+	pthread_mutex_lock(&pcm->mutex);
 	ba_transport_pcm_volume_set(&pcm->volume[0], &level, NULL, NULL);
+	pthread_mutex_unlock(&pcm->mutex);
+
 	bluealsa_dbus_pcm_update(pcm, BA_DBUS_PCM_UPDATE_VOLUME);
 
 	if (rfcomm_write_at(fd, AT_TYPE_RESP, NULL, "OK") == -1)
@@ -416,11 +510,15 @@ static int rfcomm_handler_vgs_set_cb(struct ba_rfcomm *r, const struct bt_at *at
 static int rfcomm_handler_vgs_resp_cb(struct ba_rfcomm *r, const struct bt_at *at) {
 
 	struct ba_transport * const t_sco = r->sco;
-	struct ba_transport_pcm *pcm = &t_sco->sco.spk_pcm;
+	struct ba_transport_pcm *pcm = &t_sco->sco.pcm_spk;
 
-	r->gain_spk = atoi(at->value);
-	int level = ba_transport_pcm_volume_bt_to_level(pcm, r->gain_spk);
+	int gain = r->gain_spk = atoi(at->value);
+	int level = ba_transport_pcm_volume_range_to_level(gain, HFP_VOLUME_GAIN_MAX);
+
+	pthread_mutex_lock(&pcm->mutex);
 	ba_transport_pcm_volume_set(&pcm->volume[0], &level, NULL, NULL);
+	pthread_mutex_unlock(&pcm->mutex);
+
 	bluealsa_dbus_pcm_update(pcm, BA_DBUS_PCM_UPDATE_VOLUME);
 
 	return 0;
@@ -438,14 +536,24 @@ static int rfcomm_handler_btrh_get_cb(struct ba_rfcomm *r, const struct bt_at *a
 	return 0;
 }
 
+#if ENABLE_HFP_CODEC_SELECTION
+static int rfcomm_hfp_setup_codec_connection(struct ba_rfcomm *r);
+#endif
+
 /**
  * SET: Bluetooth Codec Connection */
 static int rfcomm_handler_bcc_cmd_cb(struct ba_rfcomm *r, const struct bt_at *at) {
 	(void)at;
 	const int fd = r->fd;
-	/* TODO: Start Codec Connection procedure because HF wants to send audio. */
+#if ENABLE_HFP_CODEC_SELECTION
+	if (rfcomm_write_at(fd, AT_TYPE_RESP, NULL, "OK") == -1)
+		return -1;
+	if (rfcomm_hfp_setup_codec_connection(r) == -1)
+		return -1;
+#else
 	if (rfcomm_write_at(fd, AT_TYPE_RESP, NULL, "ERROR") == -1)
 		return -1;
+#endif
 	return 0;
 }
 
@@ -457,11 +565,9 @@ static int rfcomm_handler_bcs_set_cb(struct ba_rfcomm *r, const struct bt_at *at
 	const int fd = r->fd;
 	int rv;
 
-	pthread_mutex_lock(&r->codec_selection_mtx);
-
-	int codec;
-	if ((codec = atoi(at->value)) != r->codec) {
-		warn("Codec not acknowledged: %s != %d", at->value, r->codec);
+	uint8_t codec_id;
+	if ((codec_id = atoi(at->value)) != r->codec_id) {
+		warn("Codec not acknowledged: %s != %u", at->value, r->codec_id);
 		rv = rfcomm_write_at(fd, AT_TYPE_RESP, NULL, "ERROR");
 		goto final;
 	}
@@ -471,54 +577,83 @@ static int rfcomm_handler_bcs_set_cb(struct ba_rfcomm *r, const struct bt_at *at
 
 	/* Codec negotiation process is complete. Update transport and
 	 * notify connected clients, that transport has been changed. */
-	ba_transport_set_codec(t_sco, codec);
+	ba_transport_set_codec(t_sco, codec_id);
 
 final:
-	r->codec_selection_done = true;
-	pthread_mutex_unlock(&r->codec_selection_mtx);
-	pthread_cond_signal(&r->codec_selection_cond);
+	rfcomm_finalize_codec_selection(r);
 	return rv;
 }
 
 static int rfcomm_handler_resp_bcs_ok_cb(struct ba_rfcomm *r, const struct bt_at *at) {
 
 	struct ba_transport * const t_sco = r->sco;
-	int rv;
 
-	pthread_mutex_lock(&r->codec_selection_mtx);
-
-	if ((rv = rfcomm_handler_resp_ok_cb(r, at)) == -1)
-		goto final;
+	if ((rfcomm_handler_resp_ok_cb(r, at)) == -1)
+		return -1;
 
 	if (!r->handler_resp_ok_success) {
-		warn("Codec selection not finalized: %d", r->codec);
-		goto final;
+		warn("Codec selection not finalized: %u", r->codec_id);
+		ba_transport_set_codec(t_sco, HFP_CODEC_UNDEFINED);
+		rfcomm_finalize_codec_selection(r);
 	}
 
-	/* Finalize codec selection process and notify connected clients, that
-	 * transport has been changed. Note, that this event might be emitted
-	 * for an active transport - switching initiated by Audio Gateway. */
-	ba_transport_set_codec(t_sco, r->codec);
-
-final:
-	r->codec_selection_done = true;
-	pthread_mutex_unlock(&r->codec_selection_mtx);
-	pthread_cond_signal(&r->codec_selection_cond);
-	return rv;
+	return 0;
 }
 
 /**
  * RESP: Bluetooth Codec Selection */
 static int rfcomm_handler_bcs_resp_cb(struct ba_rfcomm *r, const struct bt_at *at) {
 
-	static const struct ba_rfcomm_handler handler = {
+	static const struct ba_rfcomm_handler handler_supported = {
 		AT_TYPE_RESP, "", rfcomm_handler_resp_bcs_ok_cb };
-	const int fd = r->fd;
+	static const struct ba_rfcomm_handler handler_unsupported = {
+		AT_TYPE_RESP, "", rfcomm_handler_resp_ok_cb };
 
-	r->codec = atoi(at->value);
+	const struct {
+		uint8_t codec_id;
+		bool is_supported;
+	} codecs[] = {
+		{ HFP_CODEC_CVSD, r->hf_codecs.cvsd },
+#if ENABLE_MSBC
+		{ HFP_CODEC_MSBC, r->hf_codecs.msbc },
+#endif
+#if ENABLE_LC3_SWB
+		{ HFP_CODEC_LC3_SWB, r->hf_codecs.lc3_swb },
+#endif
+	};
+
+	const int fd = r->fd;
+	const uint8_t codec_id = atoi(at->value);
+
+	bool is_codec_supported = false;
+	for (size_t i = 0; i < ARRAYSIZE(codecs); i++)
+		if (codecs[i].codec_id == codec_id && codecs[i].is_supported) {
+			is_codec_supported = true;
+			break;
+		}
+
+	if (!is_codec_supported) {
+		/* If the requested codec is not supported, we must reply with the
+		 * list of codecs that we do support. */
+		if (rfcomm_write_at(fd, AT_TYPE_CMD_SET, "+BAC", r->hf_bac_bcs_string) == -1)
+			return -1;
+		r->handler = &handler_unsupported;
+		return 0;
+	}
+
+	r->codec_id = codec_id;
 	if (rfcomm_write_at(fd, AT_TYPE_CMD_SET, "+BCS", at->value) == -1)
 		return -1;
-	r->handler = &handler;
+	r->handler = &handler_supported;
+
+	/* The oFono AG, and possibly other AG implementations too, does not
+	 * send the "OK" confirmation until it has successfully connected a
+	 * SCO socket. So to support such an AG we must set the selected codec
+	 * here and notify connected clients, that the transport has been
+	 * changed. Note, that this event might be emitted for an active
+	 * transport - codec switching initiated by Audio Gateway. */
+	ba_transport_set_codec(r->sco, r->codec_id);
+	rfcomm_finalize_codec_selection(r);
 
 	return 0;
 }
@@ -529,32 +664,44 @@ static int rfcomm_handler_bac_set_cb(struct ba_rfcomm *r, const struct bt_at *at
 
 	const int fd = r->fd;
 	char *tmp = at->value - 1;
+	int rv;
 
 	/* We shall use the information on codecs available in HF
 	 * from the most recently received AT+BAC command. */
-	memset(&r->codecs, 0, sizeof(r->codecs));
+	memset(&r->hf_codecs, 0, sizeof(r->hf_codecs));
 
 	do {
 		tmp += 1;
 		switch (atoi(tmp)) {
 		case HFP_CODEC_CVSD:
-			r->codecs.cvsd = true;
+			r->hf_codecs.cvsd = true;
 			break;
 #if ENABLE_MSBC
 		case HFP_CODEC_MSBC:
-			r->codecs.msbc = true;
+			r->hf_codecs.msbc = true;
+			break;
+#endif
+#if ENABLE_LC3_SWB
+		case HFP_CODEC_LC3_SWB:
+			r->hf_codecs.lc3_swb = true;
 			break;
 #endif
 		}
 	} while ((tmp = strchr(tmp, ',')) != NULL);
 
-	if (rfcomm_write_at(fd, AT_TYPE_RESP, NULL, "OK") == -1)
-		return -1;
+	if ((rv = rfcomm_write_at(fd, AT_TYPE_RESP, NULL, "OK")) == -1)
+		goto final;
 
 	if (r->state < HFP_SLC_BAC_SET_OK)
 		rfcomm_set_hfp_state(r, HFP_SLC_BAC_SET_OK);
 
-	return 0;
+final:
+	if (r->state == HFP_SLC_CONNECTED)
+		/* We can receive the AT+BAC command as a response to AT+BSC in case of
+		 * invalid codec selection. In such case, we shall finalize current codec
+		 * selection procedure. */
+		rfcomm_finalize_codec_selection(r);
+	return rv;
 }
 
 /**
@@ -565,11 +712,14 @@ static int rfcomm_handler_android_set_xhsmicmute(struct ba_rfcomm *r, char *valu
 		return errno = EINVAL, -1;
 
 	struct ba_transport * const t_sco = r->sco;
-	struct ba_transport_pcm *pcm = &t_sco->sco.mic_pcm;
+	struct ba_transport_pcm *pcm = &t_sco->sco.pcm_mic;
+	const bool muted = value[0] == '0' ? false : true;
 	const int fd = r->fd;
 
-	bool muted = value[0] == '0' ? false : true;
+	pthread_mutex_lock(&pcm->mutex);
 	ba_transport_pcm_volume_set(&pcm->volume[0], NULL, NULL, &muted);
+	pthread_mutex_unlock(&pcm->mutex);
+
 	bluealsa_dbus_pcm_update(pcm, BA_DBUS_PCM_UPDATE_VOLUME);
 
 	if (rfcomm_write_at(fd, AT_TYPE_RESP, NULL, "OK") == -1)
@@ -634,8 +784,7 @@ static int rfcomm_handler_android_set_cb(struct ba_rfcomm *r, const struct bt_at
 	char *value = at->value;
 	char *name = strsep(&value, sep);
 
-	size_t i;
-	for (i = 0; i < ARRAYSIZE(handlers); i++)
+	for (size_t i = 0; i < ARRAYSIZE(handlers); i++)
 		if (strcmp(name, handlers[i].name) == 0) {
 			int rv = handlers[i].cb(r, value);
 			if (rv == -1 && errno == EINVAL)
@@ -692,30 +841,18 @@ static int rfcomm_handler_xapl_set_cb(struct ba_rfcomm *r, const struct bt_at *a
 	struct ba_device * const d = r->sco->d;
 	const int fd = r->fd;
 
-	unsigned int vendor, product;
-	char version[sizeof(d->xapl.software_version)];
-	char resp[32];
-	char *tmp;
-
-	if ((tmp = strrchr(at->value, ',')) == NULL) {
+	if (at_parse_set_xapl(at->value, &d->xapl.vendor_id, &d->xapl.product_id,
+				&d->xapl.sw_version, &d->xapl.features) == -1) {
 		warn("Invalid +XAPL value: %s", at->value);
 		if (rfcomm_write_at(fd, AT_TYPE_RESP, NULL, "ERROR") == -1)
 			return -1;
 		return 0;
 	}
 
-	d->xapl.features = atoi(tmp + 1);
-	*tmp = '\0';
-
-	if (sscanf(at->value, "%x-%x-%7s", &vendor, &product, version) != 3)
-		warn("Couldn't parse +XAPL vendor and product: %s", at->value);
-
-	d->xapl.vendor_id = vendor;
-	d->xapl.product_id = product;
-	strcpy(d->xapl.software_version, version);
-
+	char resp[32];
 	snprintf(resp, sizeof(resp), "+XAPL=%s,%u",
 			config.hfp.xapl_product_name, config.hfp.xapl_features);
+
 	if (rfcomm_write_at(fd, AT_TYPE_RESP, NULL, resp) == -1)
 		return -1;
 	if (rfcomm_write_at(fd, AT_TYPE_RESP, NULL, "OK") == -1)
@@ -818,9 +955,7 @@ static ba_rfcomm_callback *rfcomm_get_callback(const struct bt_at *at) {
 		&rfcomm_handler_xapl_resp,
 	};
 
-	size_t i;
-
-	for (i = 0; i < ARRAYSIZE(handlers); i++) {
+	for (size_t i = 0; i < ARRAYSIZE(handlers); i++) {
 		if (handlers[i]->type != at->type)
 			continue;
 		if (strcmp(handlers[i]->command, at->command) != 0)
@@ -847,48 +982,91 @@ static enum ba_rfcomm_signal rfcomm_recv_signal(struct ba_rfcomm *r) {
 	return BA_RFCOMM_SIGNAL_PING;
 }
 
-#if ENABLE_MSBC
+#if ENABLE_HFP_CODEC_SELECTION
+
 /**
- * Try to setup HFP codec connection. */
-static int rfcomm_set_hfp_codec(struct ba_rfcomm *r, uint16_t codec) {
+ * Set HFP codec for the given Service Level Connection. */
+static int rfcomm_hfp_set_codec(struct ba_rfcomm *r, uint8_t codec_id) {
 
 	struct ba_transport * const t_sco = r->sco;
 	const int fd = r->fd;
-	char tmp[16];
+	int rv = 0;
 
 	debug("RFCOMM: %s setting codec: %s",
-			ba_transport_type_to_string(t_sco->type),
-			hfp_codec_id_to_string(codec));
+			ba_transport_debug_name(t_sco),
+			hfp_codec_id_to_string(codec_id));
 
-	/* Codec selection can be requested only after SLC establishment. */
-	if (r->state != HFP_SLC_CONNECTED) {
-		/* If codec selection was requested by some other thread by calling the
-		 * ba_transport_select_codec(), we have to signal it that the selection
-		 * procedure has been completed. */
-		pthread_mutex_lock(&r->codec_selection_mtx);
-		r->codec_selection_done = true;
-		pthread_mutex_unlock(&r->codec_selection_mtx);
-		pthread_cond_signal(&r->codec_selection_cond);
+	/* SLC is required for codec connection */
+	if (r->state != HFP_SLC_CONNECTED)
+		goto fail;
+
+	/* only AG can set codec */
+	if (!(t_sco->profile & BA_TRANSPORT_PROFILE_HFP_AG))
+		goto fail;
+
+	char tmp[16];
+	sprintf(tmp, "%u", codec_id);
+	if ((rv = rfcomm_write_at(fd, AT_TYPE_RESP, "+BCS", tmp)) == -1)
+		goto fail;
+
+	r->codec_id = codec_id;
+	r->handler = &rfcomm_handler_bcs_set;
+	return 0;
+
+fail:
+	rfcomm_finalize_codec_selection(r);
+	return rv;
+}
+
+/**
+ * Try to setup HFP codec connection. */
+static int rfcomm_hfp_setup_codec_connection(struct ba_rfcomm *r) {
+
+	const struct {
+		uint8_t codec_id;
+		bool is_supported;
+	} codecs[] = {
+#if ENABLE_LC3_SWB
+		{ HFP_CODEC_LC3_SWB, r->ag_codecs.lc3_swb && r->hf_codecs.lc3_swb },
+#endif
+#if ENABLE_MSBC
+		{ HFP_CODEC_MSBC, r->ag_codecs.msbc && r->hf_codecs.msbc },
+#endif
+		{ HFP_CODEC_CVSD, r->ag_codecs.cvsd && r->hf_codecs.cvsd },
+	};
+
+	struct ba_transport * const t_sco = r->sco;
+	const int fd = r->fd;
+	int rv;
+
+	/* SLC is required for codec connection */
+	if (r->state != HFP_SLC_CONNECTED)
 		return 0;
-	}
 
-	/* for AG request codec selection using unsolicited response code */
-	if (t_sco->type.profile & BA_TRANSPORT_PROFILE_HFP_AG) {
-		sprintf(tmp, "%d", codec);
-		if (rfcomm_write_at(fd, AT_TYPE_RESP, "+BCS", tmp) == -1)
+	/* nothing to do if codec is already selected */
+	if (ba_transport_get_codec(t_sco) != HFP_CODEC_UNDEFINED)
+		return 0;
+
+	/* Only AG can initialize codec connection. So, for HF we need to request
+	 * codec selection from AG by sending AT+BCC command. */
+	if (t_sco->profile & BA_TRANSPORT_PROFILE_HFP_HF) {
+		if ((rv = rfcomm_write_at(fd, AT_TYPE_CMD, "+BCC", NULL)) == -1)
 			return -1;
-		r->codec = codec;
-		r->handler = &rfcomm_handler_bcs_set;
+		r->handler = &rfcomm_handler_resp_ok;
 		return 0;
 	}
 
-	/* TODO: Send codec connection initialization request to AG. */
-	pthread_mutex_lock(&r->codec_selection_mtx);
-	r->codec_selection_done = true;
-	pthread_mutex_unlock(&r->codec_selection_mtx);
-	pthread_cond_signal(&r->codec_selection_cond);
+	for (size_t i = 0; i < ARRAYSIZE(codecs); i++) {
+		if (!codecs[i].is_supported)
+			continue;
+		if ((rv = rfcomm_hfp_set_codec(r, codecs[i].codec_id)) == -1)
+			return -1;
+		break;
+	}
+
 	return 0;
 }
+
 #endif
 
 /**
@@ -899,16 +1077,21 @@ static int rfcomm_notify_battery_level_change(struct ba_rfcomm *r) {
 	const int fd = r->fd;
 	char tmp[32];
 
+	if (!config.battery.available)
+		return 0;
+
 	/* for HFP-AG return battery level indicator if reporting is enabled */
-	if (t_sco->type.profile & BA_TRANSPORT_PROFILE_HFP_AG &&
+	if (t_sco->profile & BA_TRANSPORT_PROFILE_HFP_AG &&
 			r->hfp_cmer[3] > 0 && r->hfp_ind_state[HFP_IND_BATTCHG]) {
-		sprintf(tmp, "%d,%d", HFP_IND_BATTCHG, (config.battery.level + 1) / 17);
-		return rfcomm_write_at(fd, AT_TYPE_RESP, "+CIND", tmp);
+		const unsigned int level = config.battery.level * 6 / 100;
+		sprintf(tmp, "%d,%d", HFP_IND_BATTCHG, MIN(level, 5));
+		return rfcomm_write_at(fd, AT_TYPE_RESP, "+CIEV", tmp);
 	}
 
-	if (t_sco->type.profile & BA_TRANSPORT_PROFILE_MASK_HF &&
+	if (t_sco->profile & BA_TRANSPORT_PROFILE_MASK_HF &&
 			t_sco->d->xapl.features & (XAPL_FEATURE_BATTERY | XAPL_FEATURE_DOCKING)) {
-		sprintf(tmp, "2,1,%d,2,0", (config.battery.level + 1) / 10);
+		const unsigned int level = config.battery.level * 10 / 100;
+		sprintf(tmp, "2,1,%d,2,0", MIN(level, 9));
 		if (rfcomm_write_at(fd, AT_TYPE_CMD_SET, "+IPHONEACCEV", tmp) == -1)
 			return -1;
 		r->handler = &rfcomm_handler_resp_ok;
@@ -922,11 +1105,12 @@ static int rfcomm_notify_battery_level_change(struct ba_rfcomm *r) {
 static int rfcomm_notify_volume_change_mic(struct ba_rfcomm *r, bool force) {
 
 	struct ba_transport * const t_sco = r->sco;
-	struct ba_transport_pcm *pcm = &t_sco->sco.mic_pcm;
+	struct ba_transport_pcm *pcm = &t_sco->sco.pcm_mic;
 	const int fd = r->fd;
 	char tmp[24];
 
-	int gain = ba_transport_pcm_volume_level_to_bt(pcm, pcm->volume[0].level);
+	int gain = ba_transport_pcm_volume_level_to_range(
+			pcm->volume[0].level, HFP_VOLUME_GAIN_MAX);
 	if (!force && r->gain_mic == gain)
 		return 0;
 
@@ -934,8 +1118,9 @@ static int rfcomm_notify_volume_change_mic(struct ba_rfcomm *r, bool force) {
 	debug("Updating microphone gain: %d", gain);
 
 	/* for AG return unsolicited response code */
-	if (t_sco->type.profile & BA_TRANSPORT_PROFILE_MASK_AG) {
-		sprintf(tmp, "+VGM=%d", gain);
+	if (t_sco->profile & BA_TRANSPORT_PROFILE_MASK_AG) {
+		bool is_hsp = t_sco->profile & BA_TRANSPORT_PROFILE_MASK_HSP;
+		sprintf(tmp, "+VGM%c%d", is_hsp ? '=' : ':', gain);
 		return rfcomm_write_at(fd, AT_TYPE_RESP, NULL, tmp);
 	}
 
@@ -952,11 +1137,12 @@ static int rfcomm_notify_volume_change_mic(struct ba_rfcomm *r, bool force) {
 static int rfcomm_notify_volume_change_spk(struct ba_rfcomm *r, bool force) {
 
 	struct ba_transport * const t_sco = r->sco;
-	struct ba_transport_pcm *pcm = &t_sco->sco.spk_pcm;
+	struct ba_transport_pcm *pcm = &t_sco->sco.pcm_spk;
 	const int fd = r->fd;
 	char tmp[24];
 
-	int gain = ba_transport_pcm_volume_level_to_bt(pcm, pcm->volume[0].level);
+	int gain = ba_transport_pcm_volume_level_to_range(
+			pcm->volume[0].level, HFP_VOLUME_GAIN_MAX);
 	if (!force && r->gain_spk == gain)
 		return 0;
 
@@ -964,8 +1150,9 @@ static int rfcomm_notify_volume_change_spk(struct ba_rfcomm *r, bool force) {
 	debug("Updating speaker gain: %d", gain);
 
 	/* for AG return unsolicited response code */
-	if (t_sco->type.profile & BA_TRANSPORT_PROFILE_MASK_AG) {
-		sprintf(tmp, "+VGS=%d", gain);
+	if (t_sco->profile & BA_TRANSPORT_PROFILE_MASK_AG) {
+		bool is_hsp = t_sco->profile & BA_TRANSPORT_PROFILE_MASK_HSP;
+		sprintf(tmp, "+VGS%c%d", is_hsp ? '=' : ':', gain);
 		return rfcomm_write_at(fd, AT_TYPE_RESP, NULL, tmp);
 	}
 
@@ -1018,6 +1205,12 @@ static void *rfcomm_thread(struct ba_rfcomm *r) {
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	pthread_cleanup_push(PTHREAD_CLEANUP(rfcomm_thread_cleanup), r);
 
+	sigset_t sigset;
+	/* See the ba_transport_pcm_start() function for information
+	 * why we have to mask all signals. */
+	sigfillset(&sigset);
+	pthread_sigmask(SIG_SETMASK, &sigset, NULL);
+
 	struct ba_transport * const t_sco = r->sco;
 	struct at_reader reader = { .next = NULL };
 	struct pollfd pfds[] = {
@@ -1026,7 +1219,7 @@ static void *rfcomm_thread(struct ba_rfcomm *r) {
 		{ -1, POLLIN, 0 },
 	};
 
-	debug("Starting RFCOMM loop: %s", ba_transport_type_to_string(t_sco->type));
+	debug("Starting RFCOMM loop: %s", ba_transport_debug_name(t_sco));
 	for (;;) {
 
 		/* During normal operation, RFCOMM should block indefinitely. However,
@@ -1060,15 +1253,17 @@ static void *rfcomm_thread(struct ba_rfcomm *r) {
 				goto ioerror;
 			}
 
-			if (t_sco->type.profile & BA_TRANSPORT_PROFILE_MASK_HSP)
+			if (t_sco->profile & BA_TRANSPORT_PROFILE_MASK_HSP) {
 				/* There is not logic behind the HSP connection,
 				 * simply set status as connected. */
 				rfcomm_set_hfp_state(r, HFP_SLC_CONNECTED);
+				goto setup;
+			}
 
-			if (t_sco->type.profile & BA_TRANSPORT_PROFILE_HFP_HF)
+			if (t_sco->profile & BA_TRANSPORT_PROFILE_HFP_HF)
 				switch (r->state) {
 				case HFP_DISCONNECTED:
-					sprintf(tmp, "%u", ba_adapter_get_hfp_features_hf(t_sco->d->a));
+					sprintf(tmp, "%u", r->hf_features);
 					if (rfcomm_write_at(pfds[1].fd, AT_TYPE_CMD_SET, "+BRSF", tmp) == -1)
 						goto ioerror;
 					r->handler = &rfcomm_handler_brsf_resp;
@@ -1078,16 +1273,11 @@ static void *rfcomm_thread(struct ba_rfcomm *r) {
 					r->handler_resp_ok_new_state = HFP_SLC_BRSF_SET_OK;
 					break;
 				case HFP_SLC_BRSF_SET_OK:
-					if (r->hfp_features & HFP_AG_FEAT_CODEC) {
-						char *ptr = tmp;
-						if (config.hfp.codecs.cvsd)
-							ptr += sprintf(ptr, "%u", HFP_CODEC_CVSD);
-#if ENABLE_MSBC
-						if (config.hfp.codecs.msbc && BA_TEST_ESCO_SUPPORT(t_sco->d->a))
-							ptr += sprintf(ptr, "%s%u", ptr != tmp ? "," : "", HFP_CODEC_MSBC);
-#endif
-						/* advertise which HFP codecs we are supporting */
-						if (rfcomm_write_at(pfds[1].fd, AT_TYPE_CMD_SET, "+BAC", tmp) == -1)
+					/* Process with codecs advertisement only if both
+					 * sides support the codec negotiation feature. */
+					if (r->ag_features & HFP_AG_FEAT_CODEC &&
+							r->hf_features & HFP_HF_FEAT_CODEC) {
+						if (rfcomm_write_at(pfds[1].fd, AT_TYPE_CMD_SET, "+BAC", r->hf_bac_bcs_string) == -1)
 							goto ioerror;
 						r->handler = &rfcomm_handler_resp_ok;
 						r->handler_resp_ok_new_state = HFP_SLC_BAC_SET_OK;
@@ -1126,15 +1316,15 @@ static void *rfcomm_thread(struct ba_rfcomm *r) {
 				case HFP_SLC_CONNECTED:
 					/* If codec was selected during the SLC establishment,
 					 * notify BlueALSA D-Bus clients about the change. */
-					if (t_sco->type.codec != HFP_CODEC_UNDEFINED) {
-						bluealsa_dbus_pcm_update(&t_sco->sco.spk_pcm,
-								BA_DBUS_PCM_UPDATE_SAMPLING | BA_DBUS_PCM_UPDATE_CODEC);
-						bluealsa_dbus_pcm_update(&t_sco->sco.mic_pcm,
-								BA_DBUS_PCM_UPDATE_SAMPLING | BA_DBUS_PCM_UPDATE_CODEC);
+					if (ba_transport_get_codec(t_sco) != HFP_CODEC_UNDEFINED) {
+						bluealsa_dbus_pcm_update(&t_sco->sco.pcm_spk,
+								BA_DBUS_PCM_UPDATE_RATE | BA_DBUS_PCM_UPDATE_CODEC);
+						bluealsa_dbus_pcm_update(&t_sco->sco.pcm_mic,
+								BA_DBUS_PCM_UPDATE_RATE | BA_DBUS_PCM_UPDATE_CODEC);
 					}
 				}
 
-			if (t_sco->type.profile & BA_TRANSPORT_PROFILE_HFP_AG)
+			if (t_sco->profile & BA_TRANSPORT_PROFILE_HFP_AG)
 				switch (r->state) {
 				case HFP_DISCONNECTED:
 				case HFP_SLC_BRSF_SET:
@@ -1151,18 +1341,19 @@ static void *rfcomm_thread(struct ba_rfcomm *r) {
 				case HFP_SLC_CONNECTED:
 					/* If codec was selected during the SLC establishment,
 					 * notify BlueALSA D-Bus clients about the change. */
-					if (t_sco->type.codec != HFP_CODEC_UNDEFINED) {
-						bluealsa_dbus_pcm_update(&t_sco->sco.spk_pcm,
-								BA_DBUS_PCM_UPDATE_SAMPLING | BA_DBUS_PCM_UPDATE_CODEC);
-						bluealsa_dbus_pcm_update(&t_sco->sco.mic_pcm,
-								BA_DBUS_PCM_UPDATE_SAMPLING | BA_DBUS_PCM_UPDATE_CODEC);
+					if (ba_transport_get_codec(t_sco) != HFP_CODEC_UNDEFINED) {
+						bluealsa_dbus_pcm_update(&t_sco->sco.pcm_spk,
+								BA_DBUS_PCM_UPDATE_RATE | BA_DBUS_PCM_UPDATE_CODEC);
+						bluealsa_dbus_pcm_update(&t_sco->sco.pcm_mic,
+								BA_DBUS_PCM_UPDATE_RATE | BA_DBUS_PCM_UPDATE_CODEC);
 					}
 				}
 
 		}
 		else if (r->setup != HFP_SETUP_COMPLETE) {
+setup:
 
-			if (t_sco->type.profile & BA_TRANSPORT_PROFILE_HSP_AG)
+			if (t_sco->profile & BA_TRANSPORT_PROFILE_HSP_AG)
 				/* We are not making any initialization setup with
 				 * HSP AG. Simply mark setup as completed. */
 				r->setup = HFP_SETUP_COMPLETE;
@@ -1170,7 +1361,7 @@ static void *rfcomm_thread(struct ba_rfcomm *r) {
 			/* Notify audio gateway about our initial setup. This setup
 			 * is dedicated for HSP and HFP, because both profiles have
 			 * volume gain control and Apple accessory extension. */
-			if (t_sco->type.profile & BA_TRANSPORT_PROFILE_MASK_HF)
+			if (t_sco->profile & BA_TRANSPORT_PROFILE_MASK_HF)
 				switch (r->setup) {
 				case HFP_SETUP_GAIN_MIC:
 					if (rfcomm_notify_volume_change_mic(r, true) == -1)
@@ -1183,50 +1374,47 @@ static void *rfcomm_thread(struct ba_rfcomm *r) {
 					r->setup++;
 					break;
 				case HFP_SETUP_ACCESSORY_XAPL:
-					sprintf(tmp, "%04X-%04X-%s,%u",
+					sprintf(tmp, "%04X-%04X-%04X,%u",
 							config.hfp.xapl_vendor_id, config.hfp.xapl_product_id,
-							config.hfp.xapl_software_version, config.hfp.xapl_features);
+							config.hfp.xapl_sw_version, config.hfp.xapl_features);
 					if (rfcomm_write_at(r->fd, AT_TYPE_CMD_SET, "+XAPL", tmp) == -1)
 						goto ioerror;
 					r->handler = &rfcomm_handler_xapl_resp;
 					r->setup++;
 					break;
 				case HFP_SETUP_ACCESSORY_BATT:
-					if (config.battery.available &&
-							rfcomm_notify_battery_level_change(r) == -1)
+					if (rfcomm_notify_battery_level_change(r) == -1)
 						goto ioerror;
 					r->setup++;
 					break;
+				case HFP_SETUP_SELECT_CODEC:
+#if ENABLE_HFP_CODEC_SELECTION
+					if (r->idle) {
+						if (rfcomm_hfp_setup_codec_connection(r) == -1)
+							goto ioerror;
+						r->setup++;
+					}
+#else
+					r->setup++;
+#endif
+					/* fall-through */
 				case HFP_SETUP_COMPLETE:
 					debug("Initial connection setup completed");
 				}
 
 			/* If HFP transport codec is already selected (e.g. device
 			 * does not support mSBC) mark setup as completed. */
-			if (t_sco->type.profile & BA_TRANSPORT_PROFILE_HFP_AG &&
-					t_sco->type.codec != HFP_CODEC_UNDEFINED)
+			if (t_sco->profile & BA_TRANSPORT_PROFILE_HFP_AG &&
+					ba_transport_get_codec(t_sco) != HFP_CODEC_UNDEFINED)
 				r->setup = HFP_SETUP_COMPLETE;
 
-#if ENABLE_MSBC
+#if ENABLE_HFP_CODEC_SELECTION
 			/* Select HFP transport codec. Please note, that this setup
 			 * stage will be performed when the connection becomes idle. */
-			if (t_sco->type.profile & BA_TRANSPORT_PROFILE_HFP_AG &&
-					t_sco->type.codec == HFP_CODEC_UNDEFINED &&
+			if (t_sco->profile & BA_TRANSPORT_PROFILE_HFP_AG &&
 					r->idle) {
-				struct {
-					uint16_t codec_id;
-					bool is_supported;
-				} codecs[] = {
-					{ HFP_CODEC_MSBC, config.hfp.codecs.msbc && r->codecs.msbc },
-					{ HFP_CODEC_CVSD, config.hfp.codecs.cvsd && r->codecs.cvsd },
-				};
-				for (size_t i = 0; i < ARRAYSIZE(codecs); i++) {
-					if (!codecs[i].is_supported)
-						continue;
-					if (rfcomm_set_hfp_codec(r, codecs[i].codec_id) == -1)
-						goto ioerror;
-					break;
-				}
+				if (rfcomm_hfp_setup_codec_connection(r) == -1)
+					goto ioerror;
 				r->setup = HFP_SETUP_COMPLETE;
 			}
 #endif
@@ -1247,11 +1435,14 @@ process:
 		if (reader.next != NULL)
 			goto read;
 
-		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-
 		r->idle = false;
 		pfds[2].fd = r->handler_fd;
-		switch (poll(pfds, ARRAYSIZE(pfds), timeout)) {
+
+		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+		int poll_rv = poll(pfds, ARRAYSIZE(pfds), timeout);
+		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+
+		switch (poll_rv) {
 		case 0:
 			debug("RFCOMM poll timeout");
 			r->idle = true;
@@ -1263,22 +1454,42 @@ process:
 			goto fail;
 		}
 
-		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-
 		if (pfds[0].revents & POLLIN) {
 			/* dispatch incoming event */
 			switch (rfcomm_recv_signal(r)) {
-#if ENABLE_MSBC
+#if ENABLE_HFP_CODEC_SELECTION
 			case BA_RFCOMM_SIGNAL_HFP_SET_CODEC_CVSD:
-				if (config.hfp.codecs.cvsd &&
-						rfcomm_set_hfp_codec(r, HFP_CODEC_CVSD) == -1)
+				if (!config.hfp.codecs.cvsd || !(
+							r->ag_features & HFP_AG_FEAT_CODEC &&
+							r->hf_features & HFP_HF_FEAT_CODEC))
+					rfcomm_finalize_codec_selection(r);
+				else if (rfcomm_hfp_set_codec(r, HFP_CODEC_CVSD) == -1)
 					goto ioerror;
 				break;
+# if ENABLE_MSBC
 			case BA_RFCOMM_SIGNAL_HFP_SET_CODEC_MSBC:
-				if (config.hfp.codecs.msbc &&
-						rfcomm_set_hfp_codec(r, HFP_CODEC_MSBC) == -1)
+				if (!config.hfp.codecs.msbc || !(
+							r->ag_features & HFP_AG_FEAT_CODEC &&
+							r->ag_features & HFP_AG_FEAT_ESCO &&
+							r->hf_features & HFP_HF_FEAT_CODEC &&
+							r->hf_features & HFP_HF_FEAT_ESCO))
+					rfcomm_finalize_codec_selection(r);
+				else if (rfcomm_hfp_set_codec(r, HFP_CODEC_MSBC) == -1)
 					goto ioerror;
 				break;
+# endif
+# if ENABLE_LC3_SWB
+			case BA_RFCOMM_SIGNAL_HFP_SET_CODEC_LC3_SWB:
+				if (!config.hfp.codecs.lc3_swb || !(
+							r->ag_features & HFP_AG_FEAT_CODEC &&
+							r->ag_features & HFP_AG_FEAT_ESCO &&
+							r->hf_features & HFP_HF_FEAT_CODEC &&
+							r->hf_features & HFP_HF_FEAT_ESCO))
+					rfcomm_finalize_codec_selection(r);
+				else if (rfcomm_hfp_set_codec(r, HFP_CODEC_LC3_SWB) == -1)
+					goto ioerror;
+				break;
+# endif
 #endif
 			case BA_RFCOMM_SIGNAL_UPDATE_BATTERY:
 				if (rfcomm_notify_battery_level_change(r) == -1)
@@ -1391,7 +1602,6 @@ ioerror:
 	}
 
 fail:
-	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	pthread_cleanup_pop(1);
 	return NULL;
 }
@@ -1411,23 +1621,79 @@ struct ba_rfcomm *ba_rfcomm_new(struct ba_transport *sco, int fd) {
 	r->thread = config.main_thread;
 	r->state = HFP_DISCONNECTED;
 	r->state_prev = HFP_DISCONNECTED;
-	r->codec = HFP_CODEC_UNDEFINED;
+	r->codec_id = HFP_CODEC_UNDEFINED;
 	r->sco = ba_transport_ref(sco);
 	r->link_lost_quirk = true;
 
-	/* initialize data used for synchronization */
-	r->gain_mic = ba_transport_pcm_volume_level_to_bt(
-			&r->sco->sco.mic_pcm, r->sco->sco.mic_pcm.volume[0].level);
-	r->gain_spk = ba_transport_pcm_volume_level_to_bt(
-			&r->sco->sco.spk_pcm, r->sco->sco.spk_pcm.volume[0].level);
+	/* Initialize HFP feature masks and codec flags. Values for the remote
+	 * device will be set during the SLC establishment. */
+
+	if (sco->profile & BA_TRANSPORT_PROFILE_HFP_AG)
+		r->ag_features = ba_adapter_get_hfp_features_ag(sco->d->a);
+	if (sco->profile & BA_TRANSPORT_PROFILE_HFP_HF)
+		r->hf_features = ba_adapter_get_hfp_features_hf(sco->d->a);
+
+	/* HSP does not support codec negotiation, so we can set the codec
+	 * flag right away. */
+	if (sco->profile & BA_TRANSPORT_PROFILE_MASK_HSP) {
+		r->ag_codecs.cvsd = true;
+		r->hf_codecs.cvsd = true;
+	}
+
+	if (sco->profile & BA_TRANSPORT_PROFILE_HFP_AG) {
+		if (config.hfp.codecs.cvsd)
+			r->ag_codecs.cvsd = true;
+#if ENABLE_MSBC
+		if (config.hfp.codecs.msbc && r->ag_features & HFP_AG_FEAT_ESCO)
+			r->ag_codecs.msbc = true;
+#endif
+#if ENABLE_LC3_SWB
+		if (config.hfp.codecs.lc3_swb && r->ag_features & HFP_AG_FEAT_ESCO)
+			r->ag_codecs.lc3_swb = true;
+#endif
+	}
+
+	if (sco->profile & BA_TRANSPORT_PROFILE_HFP_HF) {
+
+		char *ptr = r->hf_bac_bcs_string;
+
+		if (config.hfp.codecs.cvsd) {
+			ptr += sprintf(ptr, "%u", HFP_CODEC_CVSD);
+			r->hf_codecs.cvsd = true;
+		}
+
+#if ENABLE_MSBC
+		if (config.hfp.codecs.msbc && r->hf_features & HFP_HF_FEAT_ESCO) {
+			const bool first = ptr == r->hf_bac_bcs_string;
+			ptr += sprintf(ptr, "%s%u", first ? "" : ",", HFP_CODEC_MSBC);
+			r->hf_codecs.msbc = true;
+		}
+#endif
+#if ENABLE_LC3_SWB
+		if (config.hfp.codecs.lc3_swb && r->hf_features & HFP_HF_FEAT_ESCO) {
+			const bool first = ptr == r->hf_bac_bcs_string;
+			ptr += sprintf(ptr, "%s%u", first ? "" : ",", HFP_CODEC_LC3_SWB);
+			r->hf_codecs.lc3_swb = true;
+		}
+#endif
+
+	}
+
+	/* By default, all indicators are enabled. */
+	memset(&r->hfp_ind_state, 1, sizeof(r->hfp_ind_state));
+
+	/* Initialize data used for volume gain synchronization. */
+	r->gain_mic = ba_transport_pcm_volume_level_to_range(
+			sco->sco.pcm_mic.volume[0].level, HFP_VOLUME_GAIN_MAX);
+	r->gain_spk = ba_transport_pcm_volume_level_to_range(
+			sco->sco.pcm_spk.volume[0].level, HFP_VOLUME_GAIN_MAX);
 
 	if (pipe(r->sig_fd) == -1)
 		goto fail;
 
-	pthread_mutex_init(&r->codec_selection_mtx, NULL);
 	pthread_cond_init(&r->codec_selection_cond, NULL);
 
-	if ((err = pthread_create(&r->thread, NULL, PTHREAD_ROUTINE(rfcomm_thread), r)) != 0) {
+	if ((err = pthread_create(&r->thread, NULL, PTHREAD_FUNC(rfcomm_thread), r)) != 0) {
 		error("Couldn't create RFCOMM thread: %s", strerror(err));
 		r->thread = config.main_thread;
 		goto fail;
@@ -1436,7 +1702,7 @@ struct ba_rfcomm *ba_rfcomm_new(struct ba_transport *sco, int fd) {
 	const char *name = "ba-rfcomm";
 	pthread_setname_np(r->thread, name);
 	debug("Created new RFCOMM thread [%s]: %s",
-			name, ba_transport_type_to_string(sco->type));
+			name, ba_transport_debug_name(sco));
 
 	r->ba_dbus_path = g_strdup_printf("%s/rfcomm", sco->d->ba_dbus_path);
 	bluealsa_dbus_rfcomm_register(r);
@@ -1462,12 +1728,18 @@ void ba_rfcomm_destroy(struct ba_rfcomm *r) {
 	 * RFCOMM thread during the destroy procedure. */
 	bluealsa_dbus_rfcomm_unregister(r);
 
-	if (!pthread_equal(r->thread, config.main_thread) &&
-			!pthread_equal(r->thread, pthread_self())) {
-		if ((err = pthread_cancel(r->thread)) != 0 && err != ESRCH)
-			warn("Couldn't cancel RFCOMM thread: %s", strerror(err));
-		if ((err = pthread_join(r->thread, NULL)) != 0)
-			warn("Couldn't join RFCOMM thread: %s", strerror(err));
+	if (!pthread_equal(r->thread, config.main_thread)) {
+		if (!pthread_equal(r->thread, pthread_self())) {
+			if ((err = pthread_cancel(r->thread)) != 0 && err != ESRCH)
+				warn("Couldn't cancel RFCOMM thread: %s", strerror(err));
+			if ((err = pthread_join(r->thread, NULL)) != 0)
+				warn("Couldn't join RFCOMM thread: %s", strerror(err));
+		}
+		else {
+			/* It seems that the thread is being destroyed by the link lost
+			 * quirk. Detach itself so we will not leak resources. */
+			pthread_detach(r->thread);
+		}
 	}
 
 	if (r->handler_fd != -1)
@@ -1484,7 +1756,6 @@ void ba_rfcomm_destroy(struct ba_rfcomm *r) {
 	if (r->ba_dbus_path != NULL)
 		g_free(r->ba_dbus_path);
 
-	pthread_mutex_destroy(&r->codec_selection_mtx);
 	pthread_cond_destroy(&r->codec_selection_cond);
 
 	free(r);

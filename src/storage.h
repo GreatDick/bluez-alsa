@@ -1,6 +1,6 @@
 /*
  * BlueALSA - storage.h
- * Copyright (c) 2016-2022 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -17,12 +17,14 @@
 #endif
 
 #include "ba-device.h"
-#include "ba-transport.h"
+#include "ba-transport-pcm.h"
 
 int storage_init(const char *root);
+void storage_destroy(void);
 
 int storage_device_load(const struct ba_device *d);
 int storage_device_save(const struct ba_device *d);
+int storage_device_clear(const struct ba_device *d);
 
 int storage_pcm_data_sync(struct ba_transport_pcm *pcm);
 int storage_pcm_data_update(const struct ba_transport_pcm *pcm);

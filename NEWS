@@ -1,15 +1,73 @@
 unreleased
 ==========
 
+- renamed bluealsa to bluealsad (no backward compatibility)
+- renamed bluealsa.conf to org.bluealsa.conf (no backward compatibility)
+- renamed bluealsa-cli to bluealsactl (no backward compatibility)
+- optional support for A2DP Sink and Source with LHDC v3 codec
+- channel map and volume control for surround sound (5.1, 7.1) audio
+- native A2DP volume control by default (dropped --a2dp-volume option)
+- fix configuration for Android 13 A2DP Opus codec
+
+bluez-alsa v4.3.1 (2024-08-30)
+==============================
+
+- fix crash when playing audio with more than 2 channels
+- fix AAC configuration selection for low sample rates
+
+bluez-alsa v4.3.0 (2024-08-13)
+==============================
+
+- optional support for Android 13 A2DP Opus codec
+- multi channels and sample rates mode for ALSA PCM plug-in
+- bluealsa-aplay: fix volume synchronization on Raspberry Pi
+
+bluez-alsa v4.2.0 (2024-05-11)
+==============================
+
+- optional support for BLE MIDI 1.0 profile as a GATT server
+- optional support for HFP LC3-SWB (Super Wide Band) codec
+- command line option to set real-time priority for IO threads
+- command line option to filter log messages based on severity
+- allow to select individual extended controls in ALSA plug-in
+- codec-specific delay adjustment with ALSA control and persistency
+- improved AAC codec support to be conformant with A2DP v1.4
+- fix for SBC codec and audio scaling on big-endian platforms
+- fix mSBC decode for MTU > 60 bytes (e.g. Realtek USB adapters)
+- bluealsa-aplay: option to auto-select volume mode for used PCM
+- support use of libfreeaptx for apt-X and apt-X HD codecs
+- stability fixes for ALSA PCM I/O plug-in
+
+bluez-alsa v4.1.1 (2023-06-24)
+==============================
+
+- fix for oFono HF role SCO socket authorization
+- fix for mSBC MTU adjustment for Realtek USB adapters
+- bluealsa-aplay: fix playback after BT codec update
+
+bluez-alsa v4.1.0 (2023-05-23)
+==============================
+
+- removed deprecated org.bluealsa.Manager1 D-Bus interface
 - persistent storage for PCM volume and mute state
+- PCM volume control with oFono HFP-AG and HFP-HF profiles
+- transport running state exported in PCM D-Bus interface
+- A2DP codec configuration blob exported in PCM D-Bus interface
 - optional non-dynamic operation mode for ALSA control plug-in
 - optional extended controls for ALSA control plug-in
+- changed RFCOMM D-Bus API features property to array of strings
+- fix for SCO link establishment for oFono HFP-AG profile
+- fix for volume control for HSP-HS and HFP-HF profiles
+- stability fixes for ALSA PCM I/O and control plug-ins
+- bluealsa-aplay: fix for volume synchronization
+- lots of fixes for race conditions (TSAN)
+- lots of updates to the manual pages
 
 bluez-alsa v4.0.0 (2022-06-03)
 ==============================
 
 - changes in command line options (no backward compatibility)
-- implement D-Bus ObjectManager (deprecate org.bluealsa.Manger1)
+- implement D-Bus ObjectManager (deprecate org.bluealsa.Manager1)
 - optional support for A2DP FastStream codec (music & voice)
 - optional support for A2DP LC3plus codec (music & voice)
 - enhanced SBC XQ mode (XQ+) which bumps bitrate to 595 kbps

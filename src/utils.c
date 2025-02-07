@@ -1,6 +1,6 @@
 /*
  * BlueALSA - utils.c
- * Copyright (c) 2016-2021 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -9,6 +9,10 @@
  */
 
 #include "utils.h"
+
+#if HAVE_CONFIG_H
+# include <config.h>
+#endif
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -22,8 +26,10 @@
 # include "ldacBT.h"
 #endif
 
-#include "hfp.h"
-#include "shared/a2dp-codecs.h"
+#if ENABLE_LHDC
+# include <lhdcBT_dec.h>
+#endif
+
 #include "shared/defs.h"
 #include "shared/log.h"
 
@@ -49,12 +55,11 @@ int g_dbus_bluez_object_path_to_hci_dev_id(const char *path) {
 bdaddr_t *g_dbus_bluez_object_path_to_bdaddr(const char *path, bdaddr_t *addr) {
 
 	char tmp[sizeof("00:00:00:00:00:00")] = { 0 };
-	size_t i;
 
 	if ((path = strstr(path, "/dev_")) != NULL)
 		strncpy(tmp, path + 5, sizeof(tmp) - 1);
 
-	for (i = 0; i < sizeof(tmp); i++)
+	for (size_t i = 0; i < sizeof(tmp); i++)
 		if (tmp[i] == '_')
 			tmp[i] = ':';
 
@@ -62,97 +67,6 @@ bdaddr_t *g_dbus_bluez_object_path_to_bdaddr(const char *path, bdaddr_t *addr) {
 		return NULL;
 
 	return addr;
-}
-
-/**
- * Get BlueZ D-Bus object path for given transport type.
- *
- * @param type Transport type structure.
- * @return This function returns BlueZ D-Bus object path. */
-const char *g_dbus_transport_type_to_bluez_object_path(struct ba_transport_type type) {
-	switch (type.profile) {
-	case BA_TRANSPORT_PROFILE_A2DP_SOURCE:
-		switch (type.codec) {
-		case A2DP_CODEC_SBC:
-			return "/A2DP/SBC/source";
-#if ENABLE_MPEG
-		case A2DP_CODEC_MPEG12:
-			return "/A2DP/MPEG/source";
-#endif
-#if ENABLE_AAC
-		case A2DP_CODEC_MPEG24:
-			return "/A2DP/AAC/source";
-#endif
-#if ENABLE_APTX
-		case A2DP_CODEC_VENDOR_APTX:
-			return "/A2DP/aptX/source";
-#endif
-#if ENABLE_APTX_HD
-		case A2DP_CODEC_VENDOR_APTX_HD:
-			return "/A2DP/aptXHD/source";
-#endif
-#if ENABLE_FASTSTREAM
-		case A2DP_CODEC_VENDOR_FASTSTREAM:
-			return "/A2DP/FastStream/source";
-#endif
-#if ENABLE_LC3PLUS
-		case A2DP_CODEC_VENDOR_LC3PLUS:
-			return "/A2DP/LC3plus/source";
-#endif
-#if ENABLE_LDAC
-		case A2DP_CODEC_VENDOR_LDAC:
-			return "/A2DP/LDAC/source";
-#endif
-		default:
-			error("Unsupported A2DP codec: %#x", type.codec);
-			g_assert_not_reached();
-		}
-	case BA_TRANSPORT_PROFILE_A2DP_SINK:
-		switch (type.codec) {
-		case A2DP_CODEC_SBC:
-			return "/A2DP/SBC/sink";
-#if ENABLE_MPEG
-		case A2DP_CODEC_MPEG12:
-			return "/A2DP/MPEG/sink";
-#endif
-#if ENABLE_AAC
-		case A2DP_CODEC_MPEG24:
-			return "/A2DP/AAC/sink";
-#endif
-#if ENABLE_APTX
-		case A2DP_CODEC_VENDOR_APTX:
-			return "/A2DP/aptX/sink";
-#endif
-#if ENABLE_APTX_HD
-		case A2DP_CODEC_VENDOR_APTX_HD:
-			return "/A2DP/aptXHD/sink";
-#endif
-#if ENABLE_FASTSTREAM
-		case A2DP_CODEC_VENDOR_FASTSTREAM:
-			return "/A2DP/FastStream/sink";
-#endif
-#if ENABLE_LC3PLUS
-		case A2DP_CODEC_VENDOR_LC3PLUS:
-			return "/A2DP/LC3plus/sink";
-#endif
-#if ENABLE_LDAC
-		case A2DP_CODEC_VENDOR_LDAC:
-			return "/A2DP/LDAC/sink";
-#endif
-		default:
-			error("Unsupported A2DP codec: %#x", type.codec);
-			g_assert_not_reached();
-		}
-	case BA_TRANSPORT_PROFILE_HFP_HF:
-		return "/HFP/HandsFree";
-	case BA_TRANSPORT_PROFILE_HFP_AG:
-		return "/HFP/AudioGateway";
-	case BA_TRANSPORT_PROFILE_HSP_HS:
-		return "/HSP/Headset";
-	case BA_TRANSPORT_PROFILE_HSP_AG:
-		return "/HSP/AudioGateway";
-	}
-	return "/";
 }
 
 /**
@@ -188,6 +102,25 @@ bool g_variant_validate_value(GVariant *value, const GVariantType *type,
 }
 
 /**
+ * Create a new watch source for the given I/O channel.
+ *
+ * @param channel A pointer to the GIOChannel.
+ * @param priority The priority of the source.
+ * @param cond The condition to watch for.
+ * @param func The function to call when the condition is satisfied.
+ * @param userdata Data to pass to the function.
+ * @param notify Function to call when the source is destroyed.
+ * @return New watch source. */
+GSource *g_io_create_watch_full(GIOChannel *channel, int priority,
+		GIOCondition cond, GIOFunc func, void *userdata, GDestroyNotify notify) {
+	GSource *watch = g_io_create_watch(channel, cond);
+	g_source_set_callback(watch, G_SOURCE_FUNC(func), userdata, notify);
+	g_source_set_priority(watch, priority);
+	g_source_attach(watch, NULL);
+	return watch;
+}
+
+/**
  * Convert a pointer to BT address to a hash value.
  *
  * @param v A pointer to bdaddr_t structure.
@@ -207,116 +140,12 @@ gboolean g_bdaddr_equal(const void *v1, const void *v2) {
 	return bacmp(v1, v2) == 0;
 }
 
-/**
- * Convert BlueALSA transport type into a human-readable string.
- *
- * @param type Transport type structure.
- * @return Human-readable string. */
-const char *ba_transport_type_to_string(struct ba_transport_type type) {
-	switch (type.profile) {
-	case BA_TRANSPORT_PROFILE_A2DP_SOURCE:
-		switch (type.codec) {
-		case A2DP_CODEC_SBC:
-			return "A2DP Source (SBC)";
-#if ENABLE_MPEG
-		case A2DP_CODEC_MPEG12:
-			return "A2DP Source (MP3)";
-#endif
-#if ENABLE_AAC
-		case A2DP_CODEC_MPEG24:
-			return "A2DP Source (AAC)";
-#endif
-#if ENABLE_APTX
-		case A2DP_CODEC_VENDOR_APTX:
-			return "A2DP Source (aptX)";
-#endif
-#if ENABLE_APTX_HD
-		case A2DP_CODEC_VENDOR_APTX_HD:
-			return "A2DP Source (aptX HD)";
-#endif
-#if ENABLE_FASTSTREAM
-		case A2DP_CODEC_VENDOR_FASTSTREAM:
-			return "A2DP Source (FastStream)";
-#endif
-#if ENABLE_LC3PLUS
-		case A2DP_CODEC_VENDOR_LC3PLUS:
-			return "A2DP Source (LC3plus)";
-#endif
-#if ENABLE_LDAC
-		case A2DP_CODEC_VENDOR_LDAC:
-			return "A2DP Source (LDAC)";
-#endif
-		default:
-			return "A2DP Source";
-		}
-	case BA_TRANSPORT_PROFILE_A2DP_SINK:
-		switch (type.codec) {
-		case A2DP_CODEC_SBC:
-			return "A2DP Sink (SBC)";
-#if ENABLE_MPEG
-		case A2DP_CODEC_MPEG12:
-			return "A2DP Sink (MP3)";
-#endif
-#if ENABLE_AAC
-		case A2DP_CODEC_MPEG24:
-			return "A2DP Sink (AAC)";
-#endif
-#if ENABLE_APTX
-		case A2DP_CODEC_VENDOR_APTX:
-			return "A2DP Sink (aptX)";
-#endif
-#if ENABLE_APTX_HD
-		case A2DP_CODEC_VENDOR_APTX_HD:
-			return "A2DP Sink (aptX HD)";
-#endif
-#if ENABLE_FASTSTREAM
-		case A2DP_CODEC_VENDOR_FASTSTREAM:
-			return "A2DP Sink (FastStream)";
-#endif
-#if ENABLE_LC3PLUS
-		case A2DP_CODEC_VENDOR_LC3PLUS:
-			return "A2DP Sink (LC3plus)";
-#endif
-#if ENABLE_LDAC
-		case A2DP_CODEC_VENDOR_LDAC:
-			return "A2DP Sink (LDAC)";
-#endif
-		default:
-			return "A2DP Sink";
-		}
-	case BA_TRANSPORT_PROFILE_HFP_HF:
-		switch (type.codec) {
-		case HFP_CODEC_CVSD:
-			return "HFP Hands-Free (CVSD)";
-		case HFP_CODEC_MSBC:
-			return "HFP Hands-Free (mSBC)";
-		default:
-			return "HFP Hands-Free";
-		}
-	case BA_TRANSPORT_PROFILE_HFP_AG:
-		switch (type.codec) {
-		case HFP_CODEC_CVSD:
-			return "HFP Audio Gateway (CVSD)";
-		case HFP_CODEC_MSBC:
-			return "HFP Audio Gateway (mSBC)";
-		default:
-			return "HFP Audio Gateway";
-		}
-	case BA_TRANSPORT_PROFILE_HSP_HS:
-		return "HSP Headset";
-	case BA_TRANSPORT_PROFILE_HSP_AG:
-		return "HSP Audio Gateway";
-	}
-	debug("Unknown transport type: %#x %#x", type.profile, type.codec);
-	return "N/A";
-}
-
 #if ENABLE_MP3LAME
 /**
- * Get maximum possible bit-rate for the given bit-rate mask.
+ * Get maximum possible bitrate for the given bitrate mask.
  *
- * @param mask MPEG-1 layer III bit-rate mask.
- * @return Bit-rate in kilobits per second. */
+ * @param mask MPEG-1 layer III bitrate mask.
+ * @return Bitrate in kilobits per second. */
 int a2dp_mpeg1_mp3_get_max_bitrate(uint16_t mask) {
 
 	static int bitrates[] = { 320, 256, 224, 192, 160, 128, 112, 96, 80, 64, 56, 48, 40, 32 };
@@ -367,6 +196,8 @@ const char *aacdec_strerror(AAC_DECODER_ERROR err) {
 		return "Success";
 	case AAC_DEC_OUT_OF_MEMORY:
 		return "Out of memory";
+	case AAC_DEC_UNKNOWN:
+		return "Unknown error";
 	case AAC_DEC_TRANSPORT_SYNC_ERROR:
 		return "Transport sync error";
 	case AAC_DEC_NOT_ENOUGH_BITS:
@@ -393,6 +224,8 @@ const char *aacdec_strerror(AAC_DECODER_ERROR err) {
 		return "Unsupported parameter";
 	case AAC_DEC_NEED_TO_RESTART:
 		return "Restart required";
+	case AAC_DEC_OUTPUT_BUFFER_TOO_SMALL:
+		return "Output buffer too small";
 	case AAC_DEC_TRANSPORT_ERROR:
 		return "Transport error";
 	case AAC_DEC_PARSE_ERROR:
@@ -460,14 +293,15 @@ const char *aacenc_strerror(AACENC_ERROR err) {
 		return "Transport library initialization error";
 	case AACENC_INIT_META_ERROR:
 		return "Metadata library initialization error";
+	case AACENC_INIT_MPS_ERROR:
+		return "MPS library initialization error";
 	case AACENC_ENCODE_ERROR:
 		return "Encoding error";
 	case AACENC_ENCODE_EOF:
 		return "End of file";
-	default:
-		debug("Unknown error code: %#x", err);
-		return "Unknown error";
 	}
+	debug("Unknown error code: %#x", err);
+	return "Unknown error";
 }
 #endif
 
@@ -518,12 +352,13 @@ const char *lc3plus_strerror(LC3PLUS_Error err) {
 		return "Invalid cutoff frequency";
 	case LC3PLUS_PADDING_ERROR:
 		return "Padding error";
+	case LC3PLUS_LFE_MODE_NOT_SUPPORTED:
+		return "LFE not supported";
 	case FRAMESIZE_ERROR:
 		return "Framesize error";
-	default:
-		debug("Unknown error code: %#x", err);
-		return "Unknown error";
 	}
+	debug("Unknown error code: %#x", err);
+	return "Unknown error";
 }
 #endif
 
@@ -596,10 +431,28 @@ const char *ldacBT_strerror(int err) {
 		return "EQMID limited";
 	case LDACBT_ERR_DEC_CONFIG_UPDATED:
 		return "Configuration updated";
-	default:
-		debug("Unknown error code: %#x (API: %u, handle: %u, block: %u)",
-				err, LDACBT_API_ERR(err), LDACBT_HANDLE_ERR(err), LDACBT_BLOCK_ERR(err));
-		return "Unknown error";
 	}
+	debug("Unknown error code: %#x (API: %u, handle: %u, block: %u)",
+			err, LDACBT_API_ERR(err), LDACBT_HANDLE_ERR(err), LDACBT_BLOCK_ERR(err));
+	return "Unknown error";
+}
+#endif
+
+#if ENABLE_LHDC
+const char *lhdcBT_dec_strerror(int err) {
+	switch (err) {
+	case LHDCBT_DEC_FUNC_SUCCEED:
+		return "Success";
+	case LHDCBT_DEC_FUNC_FAIL:
+		return "Decode failed";
+	case LHDCBT_DEC_FUNC_INPUT_NOT_ENOUGH:
+		return "Too small input buffer";
+	case LHDCBT_DEC_FUNC_OUTPUT_NOT_ENOUGH:
+		return "Output buffer too small";
+	case LHDCBT_DEC_FUNC_INVALID_SEQ_NO:
+		return "Invalid sequence number";
+	}
+	debug("Unknown error code: %#x", err);
+	return "Unknown error";
 }
 #endif

@@ -1,6 +1,6 @@
 /*
  * BlueALSA - a2dp-lc3plus.c
- * Copyright (c) 2016-2022 Arkadiusz Bokowy
+ * Copyright (c) 2016-2025 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -10,25 +10,27 @@
 
 #include "a2dp-lc3plus.h"
 
-#if ENABLE_LC3PLUS
+#if HAVE_CONFIG_H
+# include <config.h>
+#endif
 
-#include <endian.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-#include <glib.h>
-
-#include <lc3.h>
+#include <lc3plus.h>
 
 #include "a2dp.h"
 #include "audio.h"
-#include "bluealsa-config.h"
-#include "codec-sbc.h"
+#include "ba-config.h"
+#include "ba-transport.h"
+#include "ba-transport-pcm.h"
+#include "bluealsa-dbus.h"
 #include "io.h"
 #include "rtp.h"
 #include "utils.h"
@@ -38,96 +40,99 @@
 #include "shared/log.h"
 #include "shared/rt.h"
 
-static const struct a2dp_channel_mode a2dp_lc3plus_channels[] = {
-	{ A2DP_CHM_MONO, 1, LC3PLUS_CHANNELS_1 },
-	{ A2DP_CHM_STEREO, 2, LC3PLUS_CHANNELS_2 },
+static const struct a2dp_bit_mapping a2dp_lc3plus_channels[] = {
+	{ LC3PLUS_CHANNEL_MODE_MONO, .ch = { 1, a2dp_channel_map_mono } },
+	{ LC3PLUS_CHANNEL_MODE_STEREO, .ch = { 2, a2dp_channel_map_stereo } },
+	{ 0 }
 };
 
-static const struct a2dp_sampling_freq a2dp_lc3plus_samplings[] = {
-	{ 48000, LC3PLUS_SAMPLING_FREQ_48000 },
-	{ 96000, LC3PLUS_SAMPLING_FREQ_96000 },
+static const struct a2dp_bit_mapping a2dp_lc3plus_rates[] = {
+	{ LC3PLUS_SAMPLING_FREQ_48000, { 48000 } },
+	{ LC3PLUS_SAMPLING_FREQ_96000, { 96000 } },
+	{ 0 }
 };
 
-struct a2dp_codec a2dp_lc3plus_sink = {
-	.dir = A2DP_SINK,
-	.codec_id = A2DP_CODEC_VENDOR_LC3PLUS,
-	.capabilities.lc3plus = {
-		.info = A2DP_SET_VENDOR_ID_CODEC_ID(LC3PLUS_VENDOR_ID, LC3PLUS_CODEC_ID),
-		.frame_duration =
-			LC3PLUS_FRAME_DURATION_025 |
-			LC3PLUS_FRAME_DURATION_050 |
-			LC3PLUS_FRAME_DURATION_100,
-		.channels =
-			LC3PLUS_CHANNELS_1 |
-			LC3PLUS_CHANNELS_2,
-		LC3PLUS_INIT_FREQUENCY(
-				LC3PLUS_SAMPLING_FREQ_48000 |
-				LC3PLUS_SAMPLING_FREQ_96000)
-	},
-	.capabilities_size = sizeof(a2dp_lc3plus_t),
-	.channels[0] = a2dp_lc3plus_channels,
-	.channels_size[0] = ARRAYSIZE(a2dp_lc3plus_channels),
-	.samplings[0] = a2dp_lc3plus_samplings,
-	.samplings_size[0] = ARRAYSIZE(a2dp_lc3plus_samplings),
-};
-
-struct a2dp_codec a2dp_lc3plus_source = {
-	.dir = A2DP_SOURCE,
-	.codec_id = A2DP_CODEC_VENDOR_LC3PLUS,
-	.capabilities.lc3plus = {
-		.info = A2DP_SET_VENDOR_ID_CODEC_ID(LC3PLUS_VENDOR_ID, LC3PLUS_CODEC_ID),
-		.frame_duration =
-			LC3PLUS_FRAME_DURATION_025 |
-			LC3PLUS_FRAME_DURATION_050 |
-			LC3PLUS_FRAME_DURATION_100,
-		.channels =
-			LC3PLUS_CHANNELS_1 |
-			LC3PLUS_CHANNELS_2,
-		LC3PLUS_INIT_FREQUENCY(
-				LC3PLUS_SAMPLING_FREQ_48000 |
-				LC3PLUS_SAMPLING_FREQ_96000)
-	},
-	.capabilities_size = sizeof(a2dp_lc3plus_t),
-	.channels[0] = a2dp_lc3plus_channels,
-	.channels_size[0] = ARRAYSIZE(a2dp_lc3plus_channels),
-	.samplings[0] = a2dp_lc3plus_samplings,
-	.samplings_size[0] = ARRAYSIZE(a2dp_lc3plus_samplings),
-};
-
-void a2dp_lc3plus_init(void) {
+static void a2dp_lc3plus_caps_intersect(
+		void *capabilities,
+		const void *mask) {
+	a2dp_caps_bitwise_intersect(capabilities, mask, sizeof(a2dp_lc3plus_t));
 }
 
-void a2dp_lc3plus_transport_init(struct ba_transport *t) {
-
-	const struct a2dp_codec *codec = t->a2dp.codec;
-
-	t->a2dp.pcm.format = BA_TRANSPORT_PCM_FORMAT_S24_4LE;
-	t->a2dp.pcm.channels = a2dp_codec_lookup_channels(codec,
-			t->a2dp.configuration.lc3plus.channels, false);
-	t->a2dp.pcm.sampling = a2dp_codec_lookup_frequency(codec,
-			LC3PLUS_GET_FREQUENCY(t->a2dp.configuration.lc3plus), false);
-
+static int a2dp_lc3plus_caps_foreach_channel_mode(
+		const void *capabilities,
+		enum a2dp_stream stream,
+		a2dp_bit_mapping_foreach_func func,
+		void *userdata) {
+	const a2dp_lc3plus_t *caps = capabilities;
+	if (stream == A2DP_MAIN)
+		return a2dp_bit_mapping_foreach(a2dp_lc3plus_channels, caps->channel_mode, func, userdata);
+	return -1;
 }
 
-static bool a2dp_lc3plus_supported(int samplerate, int channels) {
+static int a2dp_lc3plus_caps_foreach_sample_rate(
+		const void *capabilities,
+		enum a2dp_stream stream,
+		a2dp_bit_mapping_foreach_func func,
+		void *userdata) {
+	const a2dp_lc3plus_t *caps = capabilities;
+	if (stream == A2DP_MAIN) {
+		const uint16_t sampling_freq = A2DP_LC3PLUS_GET_SAMPLING_FREQ(*caps);
+		return a2dp_bit_mapping_foreach(a2dp_lc3plus_rates, sampling_freq, func, userdata);
+	}
+	return -1;
+}
+
+static void a2dp_lc3plus_caps_select_channel_mode(
+		void *capabilities,
+		enum a2dp_stream stream,
+		unsigned int channels) {
+	a2dp_lc3plus_t *caps = capabilities;
+	if (stream == A2DP_MAIN)
+		caps->channel_mode = a2dp_bit_mapping_lookup_value(a2dp_lc3plus_channels,
+				caps->channel_mode, channels);
+}
+
+static void a2dp_lc3plus_caps_select_sample_rate(
+		void *capabilities,
+		enum a2dp_stream stream,
+		unsigned int rate) {
+	a2dp_lc3plus_t *caps = capabilities;
+	if (stream == A2DP_MAIN) {
+		const uint16_t sampling_freq = a2dp_bit_mapping_lookup_value(a2dp_lc3plus_rates,
+				A2DP_LC3PLUS_GET_SAMPLING_FREQ(*caps), rate);
+		A2DP_LC3PLUS_SET_SAMPLING_FREQ(*caps, sampling_freq);
+	}
+}
+
+static struct a2dp_caps_helpers a2dp_lc3plus_caps_helpers = {
+	.intersect = a2dp_lc3plus_caps_intersect,
+	.has_stream = a2dp_caps_has_main_stream_only,
+	.foreach_channel_mode = a2dp_lc3plus_caps_foreach_channel_mode,
+	.foreach_sample_rate = a2dp_lc3plus_caps_foreach_sample_rate,
+	.select_channel_mode = a2dp_lc3plus_caps_select_channel_mode,
+	.select_sample_rate = a2dp_lc3plus_caps_select_sample_rate,
+};
+
+static bool a2dp_lc3plus_supported(int rate, int channels) {
 
 	if (lc3plus_channels_supported(channels) == 0) {
 		error("Number of channels not supported by LC3plus library: %u", channels);
 		return false;
 	}
 
-	if (lc3plus_samplerate_supported(samplerate) == 0) {
-		error("Sampling frequency not supported by LC3plus library: %u", samplerate);
+	if (lc3plus_samplerate_supported(rate) == 0) {
+		error("sample rate not supported by LC3plus library: %u", rate);
 		return false;
 	}
 
 	return true;
 }
 
-static LC3PLUS_Enc *a2dp_lc3plus_enc_init(int samplerate, int channels) {
+static LC3PLUS_Enc *a2dp_lc3plus_enc_init(int rate, int channels) {
 	LC3PLUS_Enc *handle;
-	if ((handle = malloc(lc3plus_enc_get_size(samplerate, channels))) != NULL &&
-			lc3plus_enc_init(handle, samplerate, channels) == LC3PLUS_OK)
+	int32_t lfe_channel_array[1] = { 0 };
+	if ((handle = malloc(lc3plus_enc_get_size(rate, channels))) != NULL &&
+			lc3plus_enc_init(handle, rate, channels, 1, lfe_channel_array) == LC3PLUS_OK)
 		return handle;
 	free(handle);
 	return NULL;
@@ -140,10 +145,10 @@ static void a2dp_lc3plus_enc_free(LC3PLUS_Enc *handle) {
 	free(handle);
 }
 
-static LC3PLUS_Dec *a2dp_lc3plus_dec_init(int samplerate, int channels) {
+static LC3PLUS_Dec *a2dp_lc3plus_dec_init(int rate, int channels) {
 	LC3PLUS_Dec *handle;
-	if ((handle = malloc(lc3plus_dec_get_size(samplerate, channels))) != NULL &&
-			lc3plus_dec_init(handle, samplerate, channels, LC3PLUS_PLC_ADVANCED) == LC3PLUS_OK)
+	if ((handle = malloc(lc3plus_dec_get_size(rate, channels))) != NULL &&
+			lc3plus_dec_init(handle, rate, channels, LC3PLUS_PLC_ADVANCED, 1) == LC3PLUS_OK)
 		return handle;
 	free(handle);
 	return NULL;
@@ -169,42 +174,38 @@ static int a2dp_lc3plus_get_frame_dms(const a2dp_lc3plus_t *conf) {
 	}
 }
 
-static void *a2dp_lc3plus_enc_thread(struct ba_transport_thread *th) {
+void *a2dp_lc3plus_enc_thread(struct ba_transport_pcm *t_pcm) {
 
 	/* Cancellation should be possible only in the carefully selected place
 	 * in order to prevent memory leaks and resources not being released. */
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pcm_thread_cleanup), t_pcm);
 
-	struct ba_transport *t = th->t;
+	struct ba_transport *t = t_pcm->t;
 	struct io_poll io = { .timeout = -1 };
 
 	const a2dp_lc3plus_t *configuration = &t->a2dp.configuration.lc3plus;
-	const int lc3plus_frame_dms = a2dp_lc3plus_get_frame_dms(configuration);
-	const unsigned int channels = t->a2dp.pcm.channels;
-	const unsigned int samplerate = t->a2dp.pcm.sampling;
+	const unsigned int channels = t_pcm->channels;
+	const unsigned int rate = t_pcm->rate;
 	const unsigned int rtp_ts_clockrate = 96000;
 
 	/* check whether library supports selected configuration */
-	if (!a2dp_lc3plus_supported(samplerate, channels))
+	if (!a2dp_lc3plus_supported(rate, channels))
 		goto fail_init;
 
 	LC3PLUS_Enc *handle;
 	LC3PLUS_Error err;
 
-	if ((handle = a2dp_lc3plus_enc_init(samplerate, channels)) == NULL) {
+	if ((handle = a2dp_lc3plus_enc_init(rate, channels)) == NULL) {
 		error("Couldn't initialize LC3plus codec: %s", strerror(errno));
 		goto fail_init;
 	}
 
 	pthread_cleanup_push(PTHREAD_CLEANUP(a2dp_lc3plus_enc_free), handle);
 
-	if ((err = lc3plus_enc_set_frame_ms(handle, lc3plus_frame_dms * 0.1)) != LC3PLUS_OK) {
+	const int lc3plus_frame_dms = a2dp_lc3plus_get_frame_dms(configuration);
+	if ((err = lc3plus_enc_set_frame_dms(handle, lc3plus_frame_dms)) != LC3PLUS_OK) {
 		error("Couldn't set frame length: %s", lc3plus_strerror(err));
-		goto fail_setup;
-	}
-	if ((err = lc3plus_enc_set_hrmode(handle, 1)) != LC3PLUS_OK) {
-		error("Couldn't set hi-resolution mode: %s", lc3plus_strerror(err));
 		goto fail_setup;
 	}
 	if ((err = lc3plus_enc_set_bitrate(handle, config.lc3plus_bitrate)) != LC3PLUS_OK) {
@@ -236,6 +237,7 @@ static void *a2dp_lc3plus_enc_thread(struct ba_transport_thread *th) {
 
 	int32_t *pcm_ch1 = malloc(lc3plus_ch_samples * sizeof(int32_t));
 	int32_t *pcm_ch2 = malloc(lc3plus_ch_samples * sizeof(int32_t));
+	int32_t *pcm_ch_buffers[2] = { pcm_ch1, pcm_ch2 };
 	pthread_cleanup_push(PTHREAD_CLEANUP(free), pcm_ch1);
 	pthread_cleanup_push(PTHREAD_CLEANUP(free), pcm_ch2);
 
@@ -246,6 +248,14 @@ static void *a2dp_lc3plus_enc_thread(struct ba_transport_thread *th) {
 		goto fail_ffb;
 	}
 
+	/* Get the total delay introduced by the codec. The LC3plus library
+	 * reports total codec delay in case of both encoder and decoder API.
+	 * In order not to overestimate the delay, we are not going to report
+	 * delay in the decoder thread. */
+	const int lc3plus_delay_frames = lc3plus_enc_get_delay(handle);
+	t_pcm->codec_delay_dms = lc3plus_delay_frames * 10000 / rate;
+	ba_transport_pcm_delay_sync(t_pcm, BA_DBUS_PCM_UPDATE_DELAY);
+
 	rtp_header_t *rtp_header;
 	rtp_media_header_t *rtp_media_header;
 	/* initialize RTP headers and get anchor for payload */
@@ -254,28 +264,35 @@ static void *a2dp_lc3plus_enc_thread(struct ba_transport_thread *th) {
 
 	struct rtp_state rtp = { .synced = false };
 	/* RTP clock frequency equal to the RTP clock rate */
-	rtp_state_init(&rtp, samplerate, rtp_ts_clockrate);
+	rtp_state_init(&rtp, rate, rtp_ts_clockrate);
 
-	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_set_state_running(th);;) {
+	debug_transport_pcm_thread_loop(t_pcm, "START");
+	for (ba_transport_pcm_state_set_running(t_pcm);;) {
 
-		ssize_t samples;
-		if ((samples = io_poll_and_read_pcm(&io, &t->a2dp.pcm,
-						pcm.tail, ffb_len_in(&pcm))) <= 0) {
-			if (samples == -1)
-				error("PCM poll and read error: %s", strerror(errno));
+		switch (io_poll_and_read_pcm(&io, t_pcm, &pcm)) {
+		case -1:
+			if (errno == ESTALE) {
+				int encoded = 0;
+				void *scratch = NULL;
+				memset(pcm_ch1, 0, lc3plus_ch_samples * sizeof(*pcm_ch1));
+				memset(pcm_ch2, 0, lc3plus_ch_samples * sizeof(*pcm_ch2));
+				/* flush encoder internal buffers by feeding it with silence */
+				lc3plus_enc24(handle, pcm_ch_buffers, rtp_payload, &encoded, scratch);
+				ffb_rewind(&pcm);
+				continue;
+			}
+			error("PCM poll and read error: %s", strerror(errno));
+			/* fall-through */
+		case 0:
 			ba_transport_stop_if_no_clients(t);
 			continue;
 		}
-
-		ffb_seek(&pcm, samples);
-		samples = ffb_len_out(&pcm);
 
 		/* anchor for RTP payload */
 		bt.tail = rtp_payload;
 
 		const int32_t *input = pcm.data;
-		size_t input_samples = samples;
+		size_t input_samples = ffb_len_out(&pcm);
 		size_t output_len = ffb_len_in(&bt);
 		size_t pcm_frames = 0;
 		size_t lc3plus_frames = 0;
@@ -289,9 +306,9 @@ static void *a2dp_lc3plus_enc_thread(struct ba_transport_thread *th) {
 				lc3plus_frames < ((1 << 4) - 1)) {
 
 			int encoded = 0;
-			int32_t *in_buffers[2] = { pcm_ch1, pcm_ch2 };
-			audio_deinterleave_s24_4le(input, lc3plus_ch_samples, channels, pcm_ch1, pcm_ch2);
-			if ((err = lc3plus_enc24(handle, in_buffers, bt.tail, &encoded)) != LC3PLUS_OK) {
+			void *scratch = NULL;
+			audio_deinterleave_s24_4le(pcm_ch_buffers, input, channels, lc3plus_ch_samples);
+			if ((err = lc3plus_enc24(handle, pcm_ch_buffers, bt.tail, &encoded, scratch)) != LC3PLUS_OK) {
 				error("LC3plus encoding error: %s", lc3plus_strerror(err));
 				break;
 			}
@@ -332,10 +349,17 @@ static void *a2dp_lc3plus_enc_thread(struct ba_transport_thread *th) {
 				ffb_seek(&bt, rtp_headers_len + chunk_len);
 
 				ssize_t len = ffb_blen_out(&bt);
-				if ((len = io_bt_write(th, bt.data, len)) <= 0) {
+				if ((len = io_bt_write(t_pcm, bt.data, len)) <= 0) {
 					if (len == -1)
 						error("BT write error: %s", strerror(errno));
 					goto fail;
+				}
+
+				if (!io.initiated) {
+					/* Get the delay due to codec processing. */
+					t_pcm->processing_delay_dms = asrsync_get_dms_since_last_sync(&io.asrs);
+					ba_transport_pcm_delay_sync(t_pcm, BA_DBUS_PCM_UPDATE_DELAY);
+					io.initiated = true;
 				}
 
 				/* resend RTP headers */
@@ -355,28 +379,23 @@ static void *a2dp_lc3plus_enc_thread(struct ba_transport_thread *th) {
 
 			}
 
-			/* keep data transfer at a constant bit rate */
+			/* Keep data transfer at a constant bit rate. */
 			asrsync_sync(&io.asrs, pcm_frames);
 			/* move forward RTP timestamp clock */
 			rtp_state_update(&rtp, pcm_frames);
-
-			/* update busy delay (encoding overhead) */
-			t->a2dp.pcm.delay = asrsync_get_busy_usec(&io.asrs) / 100;
 
 			/* If the input buffer was not consumed (due to codesize limit), we
 			 * have to append new data to the existing one. Since we do not use
 			 * ring buffer, we will simply move unprocessed data to the front
 			 * of our linear buffer. */
-			ffb_shift(&pcm, samples - input_samples);
+			ffb_shift(&pcm, pcm_frames * channels);
 
 		}
 
 	}
 
 fail:
-	debug_transport_thread_loop(th, "EXIT");
-	ba_transport_thread_set_state_stopping(th);
-	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	debug_transport_pcm_thread_loop(t_pcm, "EXIT");
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -389,29 +408,30 @@ fail_init:
 	return NULL;
 }
 
-static void *a2dp_lc3plus_dec_thread(struct ba_transport_thread *th) {
+__attribute__ ((weak))
+void *a2dp_lc3plus_dec_thread(struct ba_transport_pcm *t_pcm) {
 
 	/* Cancellation should be possible only in the carefully selected place
 	 * in order to prevent memory leaks and resources not being released. */
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pcm_thread_cleanup), t_pcm);
 
-	struct ba_transport *t = th->t;
+	struct ba_transport *t = t_pcm->t;
 	struct io_poll io = { .timeout = -1 };
 
 	const a2dp_lc3plus_t *configuration = &t->a2dp.configuration.lc3plus;
-	const unsigned int channels = t->a2dp.pcm.channels;
-	const unsigned int samplerate = t->a2dp.pcm.sampling;
+	const unsigned int channels = t_pcm->channels;
+	const unsigned int rate = t_pcm->rate;
 	const unsigned int rtp_ts_clockrate = 96000;
 
 	/* check whether library supports selected configuration */
-	if (!a2dp_lc3plus_supported(samplerate, channels))
+	if (!a2dp_lc3plus_supported(rate, channels))
 		goto fail_init;
 
 	LC3PLUS_Dec *handle;
 	LC3PLUS_Error err;
 
-	if ((handle = a2dp_lc3plus_dec_init(samplerate, channels)) == NULL) {
+	if ((handle = a2dp_lc3plus_dec_init(rate, channels)) == NULL) {
 		error("Couldn't initialize LC3plus codec: %s", strerror(errno));
 		goto fail_init;
 	}
@@ -419,12 +439,8 @@ static void *a2dp_lc3plus_dec_thread(struct ba_transport_thread *th) {
 	pthread_cleanup_push(PTHREAD_CLEANUP(a2dp_lc3plus_dec_free), handle);
 
 	const int frame_dms = a2dp_lc3plus_get_frame_dms(configuration);
-	if ((err = lc3plus_dec_set_frame_ms(handle, frame_dms * 0.1)) != LC3PLUS_OK) {
+	if ((err = lc3plus_dec_set_frame_dms(handle, frame_dms)) != LC3PLUS_OK) {
 		error("Couldn't set frame length: %s", lc3plus_strerror(err));
-		goto fail_setup;
-	}
-	if ((err = lc3plus_dec_set_hrmode(handle, 1)) != LC3PLUS_OK) {
-		error("Couldn't set hi-resolution mode: %s", lc3plus_strerror(err));
 		goto fail_setup;
 	}
 
@@ -440,6 +456,7 @@ static void *a2dp_lc3plus_dec_thread(struct ba_transport_thread *th) {
 
 	int32_t *pcm_ch1 = malloc(lc3plus_ch_samples * sizeof(int32_t));
 	int32_t *pcm_ch2 = malloc(lc3plus_ch_samples * sizeof(int32_t));
+	int32_t *pcm_ch_buffers[2] = { pcm_ch1, pcm_ch2 };
 	pthread_cleanup_push(PTHREAD_CLEANUP(free), pcm_ch1);
 	pthread_cleanup_push(PTHREAD_CLEANUP(free), pcm_ch2);
 
@@ -453,17 +470,18 @@ static void *a2dp_lc3plus_dec_thread(struct ba_transport_thread *th) {
 
 	struct rtp_state rtp = { .synced = false };
 	/* RTP clock frequency equal to the RTP clock rate */
-	rtp_state_init(&rtp, samplerate, rtp_ts_clockrate);
+	rtp_state_init(&rtp, rate, rtp_ts_clockrate);
 
 	/* If true, we should skip fragmented RTP media packets until we will see
 	 * not fragmented one or the first fragment of fragmented packet. */
 	bool rtp_media_fragment_skip = false;
 
-	debug_transport_thread_loop(th, "START");
-	for (ba_transport_thread_set_state_running(th);;) {
+	debug_transport_pcm_thread_loop(t_pcm, "START");
+	for (ba_transport_pcm_state_set_running(t_pcm);;) {
 
-		ssize_t len = ffb_blen_in(&bt);
-		if ((len = io_poll_and_read_bt(&io, th, bt.data, len)) <= 0) {
+		ssize_t len;
+		ffb_rewind(&bt);
+		if ((len = io_poll_and_read_bt(&io, t_pcm, &bt)) <= 0) {
 			if (len == -1)
 				error("BT poll and read error: %s", strerror(errno));
 			goto fail;
@@ -488,7 +506,7 @@ static void *a2dp_lc3plus_dec_thread(struct ba_transport_thread *th) {
 			ffb_rewind(&bt_payload);
 		}
 
-		if (!ba_transport_pcm_is_active(&t->a2dp.pcm)) {
+		if (!ba_transport_pcm_is_active(t_pcm)) {
 			rtp.synced = false;
 			continue;
 		}
@@ -502,16 +520,17 @@ static void *a2dp_lc3plus_dec_thread(struct ba_transport_thread *th) {
 
 		while (missing_pcm_frames > 0) {
 
-			int32_t *out_buffers[2] = { pcm_ch1, pcm_ch2 };
-			lc3plus_dec24(handle, bt_payload.data, 0, out_buffers, 1);
-			audio_interleave_s24_4le(pcm_ch1, pcm_ch2, lc3plus_ch_samples, channels, pcm.data);
+			void *scratch = NULL;
+			lc3plus_dec24(handle, bt_payload.data, 0, pcm_ch_buffers, scratch, 1);
+			audio_interleave_s24_4le(pcm.data, (const int32_t **)pcm_ch_buffers,
+					channels, lc3plus_ch_samples);
 
 			warn("Missing LC3plus data, loss concealment applied");
 
 			const size_t samples = lc3plus_frame_samples;
-			io_pcm_scale(&t->a2dp.pcm, pcm.data, samples);
-			if (io_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
-				error("FIFO write error: %s", strerror(errno));
+			io_pcm_scale(t_pcm, pcm.data, samples);
+			if (io_pcm_write(t_pcm, pcm.data, samples) == -1)
+				error("PCM write error: %s", strerror(errno));
 
 			missing_pcm_frames -= lc3plus_ch_samples;
 
@@ -557,9 +576,10 @@ static void *a2dp_lc3plus_dec_thread(struct ba_transport_thread *th) {
 		/* Decode retrieved LC3plus frames. */
 		while (lc3plus_frames--) {
 
-			int32_t *out_buffers[2] = { pcm_ch1, pcm_ch2 };
-			err = lc3plus_dec24(handle, lc3plus_payload, lc3plus_frame_len, out_buffers, 0);
-			audio_interleave_s24_4le(pcm_ch1, pcm_ch2, lc3plus_ch_samples, channels, pcm.data);
+			void *scratch = NULL;
+			err = lc3plus_dec24(handle, lc3plus_payload, lc3plus_frame_len, pcm_ch_buffers, scratch, 0);
+			audio_interleave_s24_4le(pcm.data, (const int32_t **)pcm_ch_buffers,
+					channels, lc3plus_ch_samples);
 
 			if (err == LC3PLUS_DECODE_ERROR)
 				warn("Corrupted LC3plus data, loss concealment applied");
@@ -571,9 +591,9 @@ static void *a2dp_lc3plus_dec_thread(struct ba_transport_thread *th) {
 			lc3plus_payload += lc3plus_frame_len;
 
 			const size_t samples = lc3plus_frame_samples;
-			io_pcm_scale(&t->a2dp.pcm, pcm.data, samples);
-			if (io_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
-				error("FIFO write error: %s", strerror(errno));
+			io_pcm_scale(t_pcm, pcm.data, samples);
+			if (io_pcm_write(t_pcm, pcm.data, samples) == -1)
+				error("PCM write error: %s", strerror(errno));
 
 			/* update local state with decoded PCM frames */
 			rtp_state_update(&rtp, lc3plus_ch_samples);
@@ -586,9 +606,7 @@ static void *a2dp_lc3plus_dec_thread(struct ba_transport_thread *th) {
 	}
 
 fail:
-	debug_transport_thread_loop(th, "EXIT");
-	ba_transport_thread_set_state_stopping(th);
-	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	debug_transport_pcm_thread_loop(t_pcm, "EXIT");
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
@@ -602,16 +620,171 @@ fail_init:
 	return NULL;
 }
 
-int a2dp_lc3plus_transport_start(struct ba_transport *t) {
+static int a2dp_lc3plus_configuration_select(
+		const struct a2dp_sep *sep,
+		void *capabilities) {
 
-	if (t->type.profile & BA_TRANSPORT_PROFILE_A2DP_SOURCE)
-		return ba_transport_thread_create(&t->thread_enc, a2dp_lc3plus_enc_thread, "ba-a2dp-lc3p", true);
+	a2dp_lc3plus_t *caps = capabilities;
+	const a2dp_lc3plus_t saved = *caps;
 
-	if (t->type.profile & BA_TRANSPORT_PROFILE_A2DP_SINK)
-		return ba_transport_thread_create(&t->thread_dec, a2dp_lc3plus_dec_thread, "ba-a2dp-lc3p", true);
+	/* Narrow capabilities to values supported by BlueALSA. */
+	a2dp_lc3plus_caps_intersect(caps, &sep->config.capabilities);
 
-	g_assert_not_reached();
-	return -1;
+	if (caps->frame_duration & LC3PLUS_FRAME_DURATION_100)
+		caps->frame_duration = LC3PLUS_FRAME_DURATION_100;
+	else if (caps->frame_duration & LC3PLUS_FRAME_DURATION_050)
+		caps->frame_duration = LC3PLUS_FRAME_DURATION_050;
+	else if (caps->frame_duration & LC3PLUS_FRAME_DURATION_025)
+		caps->frame_duration = LC3PLUS_FRAME_DURATION_025;
+	else {
+		error("LC3plus: No supported frame durations: %#x", saved.frame_duration);
+		return errno = ENOTSUP, -1;
+	}
+
+	unsigned int channel_mode = 0;
+	if (a2dp_lc3plus_caps_foreach_channel_mode(caps, A2DP_MAIN,
+				a2dp_bit_mapping_foreach_get_best_channel_mode, &channel_mode) != -1)
+		caps->channel_mode = channel_mode;
+	else {
+		error("LC3plus: No supported channel modes: %#x", saved.channel_mode);
+		return errno = ENOTSUP, -1;
+	}
+
+	unsigned int sampling_freq = 0;
+	if (a2dp_lc3plus_caps_foreach_sample_rate(caps, A2DP_MAIN,
+				a2dp_bit_mapping_foreach_get_best_sample_rate, &sampling_freq) != -1)
+		A2DP_LC3PLUS_SET_SAMPLING_FREQ(*caps, sampling_freq);
+	else {
+		error("LC3plus: No supported sample rates: %#x", A2DP_LC3PLUS_GET_SAMPLING_FREQ(saved));
+		return errno = ENOTSUP, -1;
+	}
+
+	return 0;
 }
 
-#endif
+static int a2dp_lc3plus_configuration_check(
+		const struct a2dp_sep *sep,
+		const void *configuration) {
+
+	const a2dp_lc3plus_t *conf = configuration;
+	a2dp_lc3plus_t conf_v = *conf;
+
+	/* Validate configuration against BlueALSA capabilities. */
+	a2dp_lc3plus_caps_intersect(&conf_v, &sep->config.capabilities);
+
+	switch (conf_v.frame_duration) {
+	case LC3PLUS_FRAME_DURATION_025:
+	case LC3PLUS_FRAME_DURATION_050:
+	case LC3PLUS_FRAME_DURATION_100:
+		break;
+	default:
+		debug("LC3plus: Invalid frame duration: %#x", conf->frame_duration);
+		return A2DP_CHECK_ERR_FRAME_DURATION;
+	}
+
+	if (a2dp_bit_mapping_lookup(a2dp_lc3plus_channels, conf_v.channel_mode) == -1) {
+		debug("LC3plus: Invalid channel mode: %#x", conf->channel_mode);
+		return A2DP_CHECK_ERR_CHANNEL_MODE;
+	}
+
+	uint16_t conf_sampling_freq = A2DP_LC3PLUS_GET_SAMPLING_FREQ(conf_v);
+	if (a2dp_bit_mapping_lookup(a2dp_lc3plus_rates, conf_sampling_freq) == -1) {
+		debug("LC3plus: Invalid sample rate: %#x", A2DP_LC3PLUS_GET_SAMPLING_FREQ(*conf));
+		return A2DP_CHECK_ERR_RATE;
+	}
+
+	return A2DP_CHECK_OK;
+}
+
+static int a2dp_lc3plus_transport_init(struct ba_transport *t) {
+
+	ssize_t channels_i;
+	if ((channels_i = a2dp_bit_mapping_lookup(a2dp_lc3plus_channels,
+					t->a2dp.configuration.lc3plus.channel_mode)) == -1)
+		return -1;
+
+	ssize_t rate_i;
+	if ((rate_i = a2dp_bit_mapping_lookup(a2dp_lc3plus_rates,
+					A2DP_LC3PLUS_GET_SAMPLING_FREQ(t->a2dp.configuration.lc3plus))) == -1)
+		return -1;
+
+	t->a2dp.pcm.format = BA_TRANSPORT_PCM_FORMAT_S24_4LE;
+	t->a2dp.pcm.channels = a2dp_lc3plus_channels[channels_i].value;
+	t->a2dp.pcm.rate = a2dp_lc3plus_rates[rate_i].value;
+
+	memcpy(t->a2dp.pcm.channel_map, a2dp_lc3plus_channels[channels_i].ch.map,
+			t->a2dp.pcm.channels * sizeof(*t->a2dp.pcm.channel_map));
+
+	return 0;
+}
+
+static int a2dp_lc3plus_source_init(struct a2dp_sep *sep) {
+	if (config.a2dp.force_mono)
+		sep->config.capabilities.lc3plus.channel_mode = LC3PLUS_CHANNEL_MODE_MONO;
+	if (config.a2dp.force_44100)
+		warn("LC3plus: 44.1 kHz sample rate not supported");
+	return 0;
+}
+
+static int a2dp_lc3plus_source_transport_start(struct ba_transport *t) {
+	return ba_transport_pcm_start(&t->a2dp.pcm, a2dp_lc3plus_enc_thread, "ba-a2dp-lc3p");
+}
+
+struct a2dp_sep a2dp_lc3plus_source = {
+	.name = "A2DP Source (LC3plus)",
+	.config = {
+		.type = A2DP_SOURCE,
+		.codec_id = A2DP_CODEC_VENDOR_ID(LC3PLUS_VENDOR_ID, LC3PLUS_CODEC_ID),
+		.caps_size = sizeof(a2dp_lc3plus_t),
+		.capabilities.lc3plus = {
+			.info = A2DP_VENDOR_INFO_INIT(LC3PLUS_VENDOR_ID, LC3PLUS_CODEC_ID),
+			.frame_duration =
+				LC3PLUS_FRAME_DURATION_025 |
+				LC3PLUS_FRAME_DURATION_050 |
+				LC3PLUS_FRAME_DURATION_100,
+			.channel_mode =
+				LC3PLUS_CHANNEL_MODE_MONO |
+				LC3PLUS_CHANNEL_MODE_STEREO,
+			A2DP_LC3PLUS_INIT_SAMPLING_FREQ(
+					LC3PLUS_SAMPLING_FREQ_48000 |
+					LC3PLUS_SAMPLING_FREQ_96000)
+		},
+	},
+	.init = a2dp_lc3plus_source_init,
+	.configuration_select = a2dp_lc3plus_configuration_select,
+	.configuration_check = a2dp_lc3plus_configuration_check,
+	.transport_init = a2dp_lc3plus_transport_init,
+	.transport_start = a2dp_lc3plus_source_transport_start,
+	.caps_helpers = &a2dp_lc3plus_caps_helpers,
+};
+
+static int a2dp_lc3plus_sink_transport_start(struct ba_transport *t) {
+	return ba_transport_pcm_start(&t->a2dp.pcm, a2dp_lc3plus_dec_thread, "ba-a2dp-lc3p");
+}
+
+struct a2dp_sep a2dp_lc3plus_sink = {
+	.name = "A2DP Sink (LC3plus)",
+	.config = {
+		.type = A2DP_SINK,
+		.codec_id = A2DP_CODEC_VENDOR_ID(LC3PLUS_VENDOR_ID, LC3PLUS_CODEC_ID),
+		.caps_size = sizeof(a2dp_lc3plus_t),
+		.capabilities.lc3plus = {
+			.info = A2DP_VENDOR_INFO_INIT(LC3PLUS_VENDOR_ID, LC3PLUS_CODEC_ID),
+			.frame_duration =
+				LC3PLUS_FRAME_DURATION_025 |
+				LC3PLUS_FRAME_DURATION_050 |
+				LC3PLUS_FRAME_DURATION_100,
+			.channel_mode =
+				LC3PLUS_CHANNEL_MODE_MONO |
+				LC3PLUS_CHANNEL_MODE_STEREO,
+			A2DP_LC3PLUS_INIT_SAMPLING_FREQ(
+					LC3PLUS_SAMPLING_FREQ_48000 |
+					LC3PLUS_SAMPLING_FREQ_96000)
+		},
+	},
+	.configuration_select = a2dp_lc3plus_configuration_select,
+	.configuration_check = a2dp_lc3plus_configuration_check,
+	.transport_init = a2dp_lc3plus_transport_init,
+	.transport_start = a2dp_lc3plus_sink_transport_start,
+	.caps_helpers = &a2dp_lc3plus_caps_helpers,
+};

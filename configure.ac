@@ -1,18 +1,19 @@
 # BlueALSA - configure.ac
-# Copyright (c) 2016-2022 Arkadiusz Bokowy
+# Copyright (c) 2016-2024 Arkadiusz Bokowy
 
-AC_PREREQ([2.60])
+AC_PREREQ([2.62])
 AC_INIT([BlueALSA],
-	[m4_normalize(esyscmd([test -d .git && git describe --always --dirty || echo v4.0.0]))],
-	[arkadiusz.bokowy@gmail.com], [bluez-alsa], [https://github.com/Arkq/bluez-alsa])
+	[m4_normalize(esyscmd([test -d .git && git describe --always --dirty || echo v4.3.1]))],
+	[arkadiusz.bokowy@gmail.com], [bluez-alsa], [https://github.com/arkq/bluez-alsa])
 AM_INIT_AUTOMAKE([foreign subdir-objects -Wall -Werror])
 
-AC_CONFIG_SRCDIR([src/bluealsa-config.c])
+AC_CONFIG_SRCDIR([src/ba-config.c])
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_MACRO_DIR([m4])
 
 AC_USE_SYSTEM_EXTENSIONS
 m4_version_prereq(2.70, [AC_PROG_CC], [AC_PROG_CC_C99])
+AC_OPENMP
 AC_PROG_INSTALL
 AC_PROG_LN_S
 AC_PROG_MKDIR_P
@@ -37,6 +38,7 @@ AC_ARG_ENABLE([debug],
 	AS_HELP_STRING([--enable-debug], [enable debugging support]))
 AM_CONDITIONAL([ENABLE_DEBUG], [test "x$enable_debug" = "xyes"])
 AM_COND_IF([ENABLE_DEBUG], [
+	AC_CHECK_FUNCS([gettid])
 	AC_CHECK_LIB([SegFault], [backtrace])
 	AC_DEFINE([DEBUG], [1], [Define to 1 if the debugging is enabled.])
 ])
@@ -84,12 +86,15 @@ AC_SEARCH_LIBS([pow], [m],
 AC_SEARCH_LIBS([pthread_create], [pthread],
 	[], [AC_MSG_ERROR([pthread library not found])])
 
-PKG_CHECK_MODULES([ALSA], [alsa])
-PKG_CHECK_MODULES([BLUEZ], [bluez >= 5.0])
+PKG_CHECK_MODULES([ALSA], [alsa >= 1.0.27])
+PKG_CHECK_MODULES([BLUEZ], [bluez >= 5.51])
 PKG_CHECK_MODULES([DBUS1], [dbus-1 >= 1.6])
 PKG_CHECK_MODULES([GIO2], [gio-unix-2.0])
-PKG_CHECK_MODULES([GLIB2], [glib-2.0 >= 2.32])
-PKG_CHECK_MODULES([SBC], [sbc >= 1.2])
+PKG_CHECK_MODULES([GLIB2], [glib-2.0 >= 2.58.2])
+PKG_CHECK_MODULES([SBC], [sbc >= 1.5])
+
+AC_PATH_PROGS([GDBUS_CODEGEN], [gdbus-codegen])
+AS_IF([test "x$GDBUS_CODEGEN" = "x"], [AC_MSG_ERROR([[gdbus-codegen not found]])])
 
 PKG_CHECK_MODULES([LIBBSD], [libbsd >= 0.8],
 	AC_DEFINE([HAVE_LIBBSD], [1], [Define to 1 if you have the libbsd library.]), [:])
@@ -109,6 +114,20 @@ AC_ARG_WITH([libopenaptx],
 	[AS_HELP_STRING([--with-libopenaptx], [use libopenaptx by pali.rohar for apt-X (HD)])])
 AM_CONDITIONAL([WITH_LIBOPENAPTX], [test "x$with_libopenaptx" = "xyes"])
 
+AC_ARG_WITH([libfreeaptx],
+	[AS_HELP_STRING([--with-libfreeaptx], [use libfreeaptx for apt-X (HD)])])
+AM_CONDITIONAL([WITH_LIBFREEAPTX], [test "x$with_libfreeaptx" = "xyes"])
+
+# one of libopenaptx or libfreeaptx have been selected
+AM_CONDITIONAL([WITH_lIBOPENAPTX_OR_WITH_LIBFREEAPTX],
+	[test "x$with_libopenaptx" = "xyes" -o "x$with_libfreeaptx" = "xyes"])
+
+# both libopenaptx and libfreeaptx have been selected
+AM_CONDITIONAL([WITH_lIBOPENAPTX_AND_WITH_LIBFREEAPTX],
+	[test "x$with_libopenaptx" = "xyes" -a "x$with_libfreeaptx" = "xyes"])
+AM_COND_IF([WITH_lIBOPENAPTX_AND_WITH_LIBFREEAPTX],
+	[AC_MSG_ERROR([select at most one of libopenaptx or libfreeaptx])])
+
 AC_ARG_ENABLE([aptx],
 	[AS_HELP_STRING([--enable-aptx], [enable apt-X support])])
 AM_CONDITIONAL([ENABLE_APTX], [test "x$enable_aptx" = "xyes"])
@@ -118,10 +137,16 @@ AM_COND_IF([ENABLE_APTX], [
 		AC_DEFINE([HAVE_APTX_DECODE], [1], [Define to 1 if you have apt-X decode library.])
 		AC_DEFINE([WITH_LIBOPENAPTX], [1], [Define to 1 if libopenaptx shall be used.])
 	], [
-		PKG_CHECK_MODULES([APTX], [openaptx >= 1.2.0])
-		if test "$($PKG_CONFIG --variable=aptxdecoder openaptx)" = "true"; then
+		AM_COND_IF([WITH_LIBFREEAPTX], [
+			PKG_CHECK_MODULES([APTX], [libfreeaptx >= 0.1.1])
 			AC_DEFINE([HAVE_APTX_DECODE], [1], [Define to 1 if you have apt-X decode library.])
-		fi
+			AC_DEFINE([WITH_LIBFREEAPTX], [1], [Define to 1 if libfreeaptx shall be used.])
+		], [
+			PKG_CHECK_MODULES([APTX], [openaptx >= 2.0.0])
+			if test "$($PKG_CONFIG --variable=aptxdecoder openaptx)" = "true"; then
+				AC_DEFINE([HAVE_APTX_DECODE], [1], [Define to 1 if you have apt-X decode library.])
+			fi
+		])
 	])
 	AC_DEFINE([ENABLE_APTX], [1], [Define to 1 if apt-X is enabled.])
 ])
@@ -135,10 +160,16 @@ AM_COND_IF([ENABLE_APTX_HD], [
 		AC_DEFINE([HAVE_APTX_HD_DECODE], [1], [Define to 1 if you have apt-X HD decode library.])
 		AC_DEFINE([WITH_LIBOPENAPTX], [1], [Define to 1 if libopenaptx shall be used.])
 	], [
-		PKG_CHECK_MODULES([APTX_HD], [openaptxhd >= 1.2.0])
-		if test "$($PKG_CONFIG --variable=aptxdecoder openaptxhd)" = "true"; then
+		AM_COND_IF([WITH_LIBFREEAPTX], [
+			PKG_CHECK_MODULES([APTX_HD], [libfreeaptx >= 0.1.1])
 			AC_DEFINE([HAVE_APTX_HD_DECODE], [1], [Define to 1 if you have apt-X HD decode library.])
-		fi
+			AC_DEFINE([WITH_LIBFREEAPTX], [1], [Define to 1 if libfreeaptx shall be used.])
+		], [
+			PKG_CHECK_MODULES([APTX_HD], [openaptx >= 2.0.0])
+			if test "$($PKG_CONFIG --variable=aptxdecoder openaptx)" = "true"; then
+				AC_DEFINE([HAVE_APTX_HD_DECODE], [1], [Define to 1 if you have apt-X HD decode library.])
+			fi
+		])
 	])
 	AC_DEFINE([ENABLE_APTX_HD], [1], [Define to 1 if apt-X HD is enabled.])
 ])
@@ -158,11 +189,24 @@ AC_ARG_ENABLE([lc3plus],
 	[AS_HELP_STRING([--enable-lc3plus], [enable LC3plus support])])
 AM_CONDITIONAL([ENABLE_LC3PLUS], [test "x$enable_lc3plus" = "xyes"])
 AM_COND_IF([ENABLE_LC3PLUS], [
-	AC_CHECK_HEADERS([lc3.h],
+	AC_CHECK_HEADERS([lc3plus.h],
 		[], [AC_MSG_ERROR([LC3plus header file not found])])
-	AC_CHECK_LIB([LC3plus], [lc3plus_version],
+	# There is no pkg-config support for LC3plus, so we have to check the library
+	# version manually. We will check for the symbols that are available in the
+	# v1.4.1 API. If the library is older the check will fail.
+	AC_CHECK_LIB([LC3plus], [lc3plus_version, lc3plus_enc_set_frame_dms],
 		[AC_SUBST([LC3PLUS_LIBS], [-lLC3plus])], [AC_MSG_ERROR([LC3plus library not found])])
 	AC_DEFINE([ENABLE_LC3PLUS], [1], [Define to 1 if LC3plus is enabled.])
+])
+
+AC_ARG_ENABLE([lc3-swb],
+	[AS_HELP_STRING([--enable-lc3-swb], [enable LC3-SWB support])])
+AM_CONDITIONAL([ENABLE_LC3_SWB], [test "x$enable_lc3_swb" = "xyes"])
+AM_COND_IF([ENABLE_LC3_SWB], [
+	PKG_CHECK_MODULES([LC3], [lc3 >= 1.0.0])
+	AC_DEFINE([ENABLE_HFP_CODEC_SELECTION], [1],
+		[Define to 1 if HFP codec selection is enabled.])
+	AC_DEFINE([ENABLE_LC3_SWB], [1], [Define to 1 if LC3-SWB is enabled.])
 ])
 
 AC_ARG_ENABLE([ldac],
@@ -176,12 +220,32 @@ AM_COND_IF([ENABLE_LDAC], [
 	AC_DEFINE([ENABLE_LDAC], [1], [Define to 1 if LDAC is enabled.])
 ])
 
+AC_ARG_ENABLE([lhdc],
+	[AS_HELP_STRING([--enable-lhdc], [enable LHDC support])])
+AM_CONDITIONAL([ENABLE_LHDC], [test "x$enable_lhdc" = "xyes"])
+AM_COND_IF([ENABLE_LHDC], [
+	AC_DEFINE([ENABLE_LHDC], [1], [Define to 1 if LHDC is enabled.])
+	PKG_CHECK_MODULES([LHDC_DEC], [lhdcBT-dec >= 4.0.2])
+	PKG_CHECK_MODULES([LHDC_ENC], [lhdcBT-enc >= 4.0.6])
+])
+
+AC_ARG_ENABLE([midi],
+	[AS_HELP_STRING([--enable-midi], [enable Bluetooth LE MIDI support])])
+AM_CONDITIONAL([ENABLE_MIDI], [test "x$enable_midi" = "xyes"])
+AM_COND_IF([ENABLE_MIDI], [
+	AC_DEFINE([ENABLE_MIDI], [1], [Define to 1 if Bluetooth LE MIDI is enabled.])
+])
+
 AC_ARG_ENABLE([mp3lame],
 	[AS_HELP_STRING([--enable-mp3lame], [enable MP3 support])])
 AM_CONDITIONAL([ENABLE_MP3LAME], [test "x$enable_mp3lame" = "xyes"])
 AM_COND_IF([ENABLE_MP3LAME], [
-	AC_CHECK_LIB([mp3lame], [lame_init],
-		[AC_SUBST([MP3LAME_LIBS], [-lmp3lame])], [AC_MSG_ERROR([mp3lame library not found])])
+	PKG_CHECK_MODULES([MP3LAME], [lame >= 3.100],,
+		# The pkg-config support is available in the not yet released version of
+		# LAME, so for now we have to check for the library manually as well to
+		# be compatible with most Linux distributions.
+		AC_CHECK_LIB([mp3lame], [lame_init],
+			[AC_SUBST([MP3LAME_LIBS], [-lmp3lame])], [AC_MSG_ERROR([mp3lame library not found])]))
 	AC_DEFINE([ENABLE_MPEG], [1], [Define to 1 if MPEG is enabled.])
 	AC_DEFINE([ENABLE_MP3LAME], [1], [Define to 1 if MP3LAME is enabled.])
 ])
@@ -204,7 +268,17 @@ AC_ARG_ENABLE([msbc],
 AM_CONDITIONAL([ENABLE_MSBC], [test "x$enable_msbc" = "xyes"])
 AM_COND_IF([ENABLE_MSBC], [
 	PKG_CHECK_MODULES([SPANDSP], [spandsp >= 0.0.6])
+	AC_DEFINE([ENABLE_HFP_CODEC_SELECTION], [1],
+		[Define to 1 if HFP codec selection is enabled.])
 	AC_DEFINE([ENABLE_MSBC], [1], [Define to 1 if mSBC is enabled.])
+])
+
+AC_ARG_ENABLE([opus],
+	AS_HELP_STRING([--enable-opus], [enable Opus support]))
+AM_CONDITIONAL([ENABLE_OPUS], [test "x$enable_opus" = "xyes"])
+AM_COND_IF([ENABLE_OPUS], [
+	PKG_CHECK_MODULES([OPUS], [opus >= 1.0.0])
+	AC_DEFINE([ENABLE_OPUS], [1], [Define to 1 if Opus is enabled.])
 ])
 
 AC_ARG_ENABLE([ofono],
@@ -219,6 +293,7 @@ AC_ARG_ENABLE([systemd],
 AM_CONDITIONAL([ENABLE_SYSTEMD], [test "x$enable_systemd" = "xyes"])
 AM_COND_IF([ENABLE_SYSTEMD], [
 	PKG_CHECK_MODULES([SYSTEMD], [systemd >= 200])
+	AC_DEFINE([ENABLE_SYSTEMD], [1], [Define to 1 if systemd is enabled.])
 ])
 
 AC_ARG_ENABLE([upower],
@@ -236,13 +311,13 @@ AM_COND_IF([ENABLE_PAYLOADCHECK], [
 	AC_DEFINE([ENABLE_PAYLOADCHECK], [1], [Define to 1 if PAYLOADCHECK is enabled.])
 ])
 
+AC_ARG_ENABLE([ctl],
+	[AS_HELP_STRING([--disable-ctl], [disable building of bluealsactl tool])])
+AM_CONDITIONAL([ENABLE_CTL], [test "x$enable_ctl" != "xno"])
+
 AC_ARG_ENABLE([aplay],
 	[AS_HELP_STRING([--disable-aplay], [disable building of bluealsa-aplay tool])])
 AM_CONDITIONAL([ENABLE_APLAY], [test "x$enable_aplay" != "xno"])
-
-AC_ARG_ENABLE([cli],
-	[AS_HELP_STRING([--enable-cli], [enable building of bluealsa-cli tool])])
-AM_CONDITIONAL([ENABLE_CLI], [test "x$enable_cli" = "xyes"])
 
 AC_ARG_ENABLE([rfcomm],
 	[AS_HELP_STRING([--enable-rfcomm], [enable building of bluealsa-rfcomm tool])])
@@ -274,10 +349,14 @@ AM_COND_IF([ENABLE_MANPAGES], [
 
 AC_ARG_ENABLE([test],
 	[AS_HELP_STRING([--enable-test], [enable unit test])])
+AM_CONDITIONAL([HAVE_SNDFILE], [false])
 AM_CONDITIONAL([ENABLE_TEST], [test "x$enable_test" = "xyes"])
 AM_COND_IF([ENABLE_TEST], [
-	PKG_CHECK_MODULES([CHECK], [check >= 0.9.10])
+	AC_SEARCH_LIBS([dlsym], [dl],
+		[], [AC_MSG_ERROR([unable to find dlsym() function])])
+	PKG_CHECK_MODULES([CHECK], [check >= 0.11.0])
 	PKG_CHECK_MODULES([SNDFILE], [sndfile >= 1.0],
+		AM_CONDITIONAL([HAVE_SNDFILE], [true])
 		AC_DEFINE([HAVE_SNDFILE], [1], [Define to 1 if you have the sndfile library.]), [:])
 ])
 
@@ -332,7 +411,7 @@ AC_SUBST([ALSA_CONF_DIR], [$alsaconfdir])
 AC_ARG_WITH([dbusconfdir],
 	AS_HELP_STRING([--with-dbusconfdir=DIR], [path to D-Bus system bus configuration files]),
 	[dbusconfdir="${withval}"],
-	[dbusconfdir=$($PKG_CONFIG --variable=sysconfdir dbus-1)/dbus-1/system.d])
+	[dbusconfdir=$($PKG_CONFIG --variable=datadir dbus-1)/dbus-1/system.d])
 AC_SUBST([DBUS_CONF_DIR], [$dbusconfdir])
 
 AC_ARG_WITH([systemdsystemunitdir],
@@ -341,27 +420,27 @@ AC_ARG_WITH([systemdsystemunitdir],
 	[systemdsystemunitdir=$($PKG_CONFIG --variable=systemdsystemunitdir systemd)])])
 AC_SUBST([SYSTEMD_SYSTEM_UNIT_DIR], [$systemdsystemunitdir])
 
-AC_ARG_WITH([systemdbluealsaargs],
-	AS_HELP_STRING([--with-systemdbluealsaargs=ARGS], [bluealsa arguments to be used in
-		bluealsa.service, defaults to '-p a2dp-source -p a2dp-sink' if not specified]),
-	[systemdbluealsaargs="${withval}"],
-	[systemdbluealsaargs="-p a2dp-source -p a2dp-sink"])
-AC_SUBST([SYSTEMD_BLUEALSA_ARGS], [$systemdbluealsaargs])
+AC_ARG_WITH([systemdbluealsadargs],
+	AS_HELP_STRING([--with-systemdbluealsadargs=ARGS], [bluealsad arguments to be used in
+		bluealsa.service, defaults to '-S -p a2dp-source -p a2dp-sink --all-codecs' if not specified]),
+	[systemdbluealsadargs="${withval}"],
+	[systemdbluealsadargs="-S -p a2dp-source -p a2dp-sink --all-codecs"])
+AC_SUBST([SYSTEMD_BLUEALSAD_ARGS], [$systemdbluealsadargs])
 
 AC_ARG_WITH([systemdbluealsaaplayargs],
 	AS_HELP_STRING([--with-systemdbluealsaaplayargs=ARGS], [bluealsa-aplay arguments to
-		be used in bluealsa-aplay.service, defaults to empty if not specified]),
+		be used in bluealsa-aplay.service, defaults to '-S' if not specified]),
 	[systemdbluealsaaplayargs="${withval}"],
-	[systemdbluealsaaplayargs=""])
+	[systemdbluealsaaplayargs="-S"])
 AC_SUBST([SYSTEMD_BLUEALSA_APLAY_ARGS], [$systemdbluealsaaplayargs])
 
-AC_ARG_WITH([bluealsauser],
-	AS_HELP_STRING([--with-bluealsauser=USER], [set up installation to run bluealsa as user
+AC_ARG_WITH([bluealsaduser],
+	AS_HELP_STRING([--with-bluealsaduser=USER], [set up installation to run bluealsad as user
 		USER, defaults to root if not specified. When used with bluez <= 5.50, USER must be a
 		member of the "bluetooth" group.]),
-	[bluealsauser="${withval}"],
-	[bluealsauser="root"])
-AC_SUBST([BLUEALSA_USER], [$bluealsauser])
+	[bluealsaduser="${withval}"],
+	[bluealsaduser="root"])
+AC_SUBST([BLUEALSAD_USER], [$bluealsaduser])
 
 AC_ARG_WITH([bluealsaaplayuser],
 	AS_HELP_STRING([--with-bluealsaaplayuser=USER], [set up installation to run bluealsa-aplay
@@ -378,11 +457,12 @@ AC_CONFIG_FILES([
 	misc/systemd/Makefile
 	src/Makefile
 	src/asound/Makefile
+	src/bluealsactl/Makefile
 	utils/Makefile
 	utils/aplay/Makefile
-	utils/cli/Makefile
 	utils/rfcomm/Makefile
-	test/Makefile])
+	test/Makefile
+	test/mock/Makefile])
 AC_OUTPUT
 
 # warn user that alsa-lib thread-safety makes troubles
@@ -396,12 +476,13 @@ AM_COND_IF([ALSA_1_1_2__1_1_3], [
 	AC_MSG_WARN([LIBASOUND_THREAD_SAFE=0 while using bluealsa PCM.])
 ])
 
-# notify user that using libopenaptx might be a good idea
+# notify user that using libopenaptx or libfreeaptx might be a good idea
 AM_COND_IF([ENABLE_APTX_OR_APTX_HD], [
-AM_COND_IF([WITH_LIBOPENAPTX], [], [
+AM_COND_IF([WITH_lIBOPENAPTX_OR_WITH_LIBFREEAPTX], [], [
 	AC_MSG_NOTICE([       *** using apt-X (HD) via Qualcomm API ***])
 	AC_MSG_NOTICE([Enabled apt-X (HD) support requires encoder (and decoder)])
 	AC_MSG_NOTICE([library with a proprietary Qualcomm API. Please consider])
-	AC_MSG_NOTICE([using --with-libopenaptx option which will use a library])
-	AC_MSG_NOTICE([based on FFmpeg project with better decoding support.])
+	AC_MSG_NOTICE([using --with-libopenaptx or --with-libfreeaptx option])
+	AC_MSG_NOTICE([which will use a library based on FFmpeg project with])
+	AC_MSG_NOTICE([better decoding support.])
 ])])

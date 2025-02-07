@@ -1,6 +1,6 @@
 /*
  * BlueALSA - log.h
- * Copyright (c) 2016-2022 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -20,9 +20,10 @@
 #include <stddef.h>
 #include <syslog.h>
 
-#include "shared/defs.h"
+#include "defs.h"
 
 void log_open(const char *ident, bool syslog);
+void log_set_min_priority(int priority);
 void log_message(int priority, const char *format, ...) __attribute__ ((format(printf, 2, 3)));
 
 #if DEBUG
@@ -46,10 +47,10 @@ void callstackdump_(const char *label);
 #endif
 
 #if DEBUG
-void hexdump_(const char *label, const void *data, size_t len, bool compact);
-# define hexdump(M, D, L, C) hexdump_(DEBUG_LOG_PREFIX M, D, L, C)
+void hexdump_(const char *label, const void *data, size_t len);
+# define hexdump(M, D, L) hexdump_(DEBUG_LOG_PREFIX M, D, L)
 #else
-# define hexdump(M, D, L, C) do {} while (0)
+# define hexdump(M, D, L) do {} while (0)
 #endif
 
 #endif

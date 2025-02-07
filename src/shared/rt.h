@@ -1,6 +1,6 @@
 /*
  * BlueALSA - rt.h
- * Copyright (c) 2016-2021 Arkadiusz Bokowy
+ * Copyright (c) 2016-2025 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -16,12 +16,12 @@
 # include <config.h>
 #endif
 
+#include <stdbool.h>
 #include <stdint.h>
-#include <sys/time.h>
 #include <time.h>
 
 #if HAVE_LIBBSD
-# include <bsd/sys/time.h>
+# include <bsd/sys/time.h> /* IWYU pragma: keep */
 #else
 # define timespecadd(ts_a, ts_b, dest) do { \
 		(dest)->tv_sec = (ts_a)->tv_sec + (ts_b)->tv_sec; \
@@ -42,14 +42,14 @@
 #endif
 
 /**
- * Structure used for time synchronization.
+ * Structure used for rate synchronization.
  *
  * With the size of the frame counter being 32 bits, it is possible to track
- * up to ~24 hours, with the sampling rate of 48 kHz. If it is insufficient,
+ * up to ~24 hours, with the sample rate of 48 kHz. If it is insufficient,
  * one can switch to 64 bits, which would suffice for 12 million years. */
 struct asrsync {
 
-	/* used sampling rate */
+	/* used sample rate */
 	unsigned int rate;
 	/* reference time point */
 	struct timespec ts0;
@@ -59,34 +59,19 @@ struct asrsync {
 	/* transferred frames since ts0 */
 	uint32_t frames;
 
-	/* time spent outside of the sync function */
-	struct timespec ts_busy;
-	/* If the asrsync_sync() returns a positive value, then this variable
-	 * contains an amount of time used for synchronization. Otherwise, it
-	 * contains an overdue time - synchronization was not possible due to
-	 * too much time spent outside of the sync function. */
+	/* Indicate whether the synchronization was required. */
+	bool synced;
+	/* If synchronization was required this variable contains an amount of
+	 * time used for the synchronization. Otherwise, it contains an overdue
+	 * time - synchronization was not possible due to too much time spent
+	 * outside of the sync function. */
 	struct timespec ts_idle;
 
 };
 
-/**
- * Start (initialize) time synchronization.
- *
- * @param asrs Pointer to the time synchronization structure.
- * @param sr Synchronization sampling rate. */
-#define asrsync_init(asrs, sr) do { \
-		(asrs)->rate = sr; \
-		gettimestamp(&(asrs)->ts0); \
-		(asrs)->ts = (asrs)->ts0; \
-		(asrs)->frames = 0; \
-	} while (0)
-
-int asrsync_sync(struct asrsync *asrs, unsigned int frames);
-
-/**
- * Get the number of microseconds spent outside of the sync function. */
-#define asrsync_get_busy_usec(asrs) \
-	((asrs)->ts_busy.tv_nsec / 1000)
+void asrsync_init(struct asrsync *asrs, unsigned int rate);
+void asrsync_sync(struct asrsync *asrs, unsigned int frames);
+unsigned int asrsync_get_dms_since_last_sync(const struct asrsync *asrs);
 
 /**
  * Get system monotonic time-stamp.
@@ -100,6 +85,13 @@ int asrsync_sync(struct asrsync *asrs, unsigned int frames);
 #else
 # define gettimestamp(ts) clock_gettime(CLOCK_MONOTONIC, ts)
 #endif
+
+/**
+ * Convert timespec structure to milliseconds.
+ *
+ * @param ts Address to the timespec structure.
+ * @return Time in milliseconds. */
+#define timespec2ms(ts) ((ts)->tv_sec * 1000 + (ts)->tv_nsec / 1000000)
 
 int difftimespec(
 		const struct timespec *ts1,

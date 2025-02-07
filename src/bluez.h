@@ -1,6 +1,6 @@
 /*
  * BlueALSA - bluez.h
- * Copyright (c) 2016-2022 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -19,13 +19,8 @@
 #include "a2dp.h"
 #include "ba-device.h"
 
-/* List of Bluetooth audio profiles. */
-#define BLUETOOTH_UUID_A2DP_SOURCE "0000110A-0000-1000-8000-00805F9B34FB"
-#define BLUETOOTH_UUID_A2DP_SINK   "0000110B-0000-1000-8000-00805F9B34FB"
-#define BLUETOOTH_UUID_HSP_HS      "00001108-0000-1000-8000-00805F9B34FB"
-#define BLUETOOTH_UUID_HSP_AG      "00001112-0000-1000-8000-00805F9B34FB"
-#define BLUETOOTH_UUID_HFP_HF      "0000111E-0000-1000-8000-00805F9B34FB"
-#define BLUETOOTH_UUID_HFP_AG      "0000111F-0000-1000-8000-00805F9B34FB"
+#define BLUEZ_A2DP_VOLUME_MIN 0
+#define BLUEZ_A2DP_VOLUME_MAX 127
 
 enum bluez_a2dp_transport_state {
 	BLUEZ_A2DP_TRANSPORT_STATE_IDLE,
@@ -34,10 +29,12 @@ enum bluez_a2dp_transport_state {
 };
 
 int bluez_init(void);
+void bluez_destroy(void);
 
 bool bluez_a2dp_set_configuration(
 		const char *dbus_current_sep_path,
-		const struct a2dp_sep *sep,
+		const struct a2dp_sep_config *remote_sep_cfg,
+		const void *configuration,
 		GError **error);
 
 void bluez_battery_provider_update(

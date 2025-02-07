@@ -1,6 +1,6 @@
 /*
  * BlueALSA - hfp.h
- * Copyright (c) 2016-2022 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  * Copyright (c) 2017 Juha Kuikka
  *
  * This file is a part of bluez-alsa.
@@ -13,56 +13,82 @@
 #ifndef BLUEALSA_HFP_H_
 #define BLUEALSA_HFP_H_
 
+#if HAVE_CONFIG_H
+# include <config.h>
+#endif
+
 #include <stdint.h>
+#include <sys/types.h>
 
 /* HFP codec IDs */
 #define HFP_CODEC_UNDEFINED 0x00
 #define HFP_CODEC_CVSD      0x01
 #define HFP_CODEC_MSBC      0x02
+#define HFP_CODEC_LC3_SWB   0x03
 
-/* SDP AG feature flags */
-#define SDP_HFP_AG_FEAT_TWC    (1 << 0)
-#define SDP_HFP_AG_FEAT_ECNR   (1 << 1)
-#define SDP_HFP_AG_FEAT_VREC   (1 << 2)
-#define SDP_HFP_AG_FEAT_RING   (1 << 3)
-#define SDP_HFP_AG_FEAT_VTAG   (1 << 4)
-#define SDP_HFP_AG_FEAT_WBAND  (1 << 5)
+/**
+ * HSP/HFP volume gain range */
+#define HFP_VOLUME_GAIN_MIN 0
+#define HFP_VOLUME_GAIN_MAX 15
 
-/* SDP HF feature flags */
-#define SDP_HFP_HF_FEAT_ECNR   (1 << 0)
-#define SDP_HFP_HF_FEAT_TWC    (1 << 1)
-#define SDP_HFP_HF_FEAT_CLI    (1 << 2)
-#define SDP_HFP_HF_FEAT_VREC   (1 << 3)
-#define SDP_HFP_HF_FEAT_VOLUME (1 << 4)
-#define SDP_HFP_HF_FEAT_WBAND  (1 << 5)
+/**
+ * SDP AG feature flags */
+#define SDP_HFP_AG_FEAT_TWC    (1 << 0) /* three-way calling */
+#define SDP_HFP_AG_FEAT_ECNR   (1 << 1) /* EC and/or NR function */
+#define SDP_HFP_AG_FEAT_VR     (1 << 2) /* voice recognition function */
+#define SDP_HFP_AG_FEAT_RING   (1 << 3) /* in-band ring tone capability */
+#define SDP_HFP_AG_FEAT_VTAG   (1 << 4) /* attach a number to a voice tag */
+#define SDP_HFP_AG_FEAT_WBS    (1 << 5) /* wide band speech */
+#define SDP_HFP_AG_FEAT_EVR    (1 << 6) /* enhanced voice recognition status */
+#define SDP_HFP_AG_FEAT_VR_TXT (1 << 7) /* voice recognition text */
+#define SDP_HFP_AG_FEAT_SWB    (1 << 8) /* super wide band speech */
 
-/* AG feature flags */
-#define HFP_AG_FEAT_3WC    (1 << 0)
-#define HFP_AG_FEAT_ECNR   (1 << 1)
-#define HFP_AG_FEAT_VOICE  (1 << 2)
-#define HFP_AG_FEAT_RING   (1 << 3)
-#define HFP_AG_FEAT_VTAG   (1 << 4)
-#define HFP_AG_FEAT_REJECT (1 << 5)
-#define HFP_AG_FEAT_ECS    (1 << 6)
-#define HFP_AG_FEAT_ECC    (1 << 7)
-#define HFP_AG_FEAT_EERC   (1 << 8)
-#define HFP_AG_FEAT_CODEC  (1 << 9)
-#define HFP_AG_FEAT_HFIND  (1 << 10)
-#define HFP_AG_FEAT_ESCO   (1 << 11)
+/**
+ * SDP HF feature flags */
+#define SDP_HFP_HF_FEAT_ECNR   (1 << 0) /* EC and/or NR function */
+#define SDP_HFP_HF_FEAT_TWC    (1 << 1) /* call waiting or three-way calling */
+#define SDP_HFP_HF_FEAT_CLI    (1 << 2) /* CLI presentation capability */
+#define SDP_HFP_HF_FEAT_VR     (1 << 3) /* voice recognition activation */
+#define SDP_HFP_HF_FEAT_VOLUME (1 << 4) /* remote audio volume control */
+#define SDP_HFP_HF_FEAT_WBS    (1 << 5) /* wide band speech */
+#define SDP_HFP_HF_FEAT_EVR    (1 << 6) /* enhanced voice recognition status */
+#define SDP_HFP_HF_FEAT_VR_TXT (1 << 7) /* voice recognition text */
+#define SDP_HFP_HF_FEAT_SWB    (1 << 8) /* super wide band speech */
 
-/* HF feature flags */
-#define HFP_HF_FEAT_ECNR   (1 << 0)
-#define HFP_HF_FEAT_3WC    (1 << 1)
-#define HFP_HF_FEAT_CLI    (1 << 2)
-#define HFP_HF_FEAT_VOICE  (1 << 3)
-#define HFP_HF_FEAT_VOLUME (1 << 4)
-#define HFP_HF_FEAT_ECS    (1 << 5)
-#define HFP_HF_FEAT_ECC    (1 << 6)
-#define HFP_HF_FEAT_CODEC  (1 << 7)
-#define HFP_HF_FEAT_HFIND  (1 << 8)
-#define HFP_HF_FEAT_ESCO   (1 << 9)
+/**
+ * AG feature flags */
+#define HFP_AG_FEAT_3WC    (1 << 0)  /* three-way calling */
+#define HFP_AG_FEAT_ECNR   (1 << 1)  /* EC and/or NR function */
+#define HFP_AG_FEAT_VOICE  (1 << 2)  /* voice recognition function */
+#define HFP_AG_FEAT_RING   (1 << 3)  /* in-band ring tone capability */
+#define HFP_AG_FEAT_VTAG   (1 << 4)  /* attach a number to a voice tag */
+#define HFP_AG_FEAT_REJECT (1 << 5)  /* ability to reject a call */
+#define HFP_AG_FEAT_ECS    (1 << 6)  /* enhanced call status */
+#define HFP_AG_FEAT_ECC    (1 << 7)  /* enhanced call control */
+#define HFP_AG_FEAT_EERC   (1 << 8)  /* extended error result codes */
+#define HFP_AG_FEAT_CODEC  (1 << 9)  /* codec negotiation */
+#define HFP_AG_FEAT_HF_IND (1 << 10) /* HF indicators */
+#define HFP_AG_FEAT_ESCO   (1 << 11) /* enhanced SCO S4 settings supported */
+#define HFP_AG_FEAT_EVRS   (1 << 12) /* enhanced voice recognition status */
+#define HFP_AG_FEAT_VR_TXT (1 << 13) /* voice recognition text */
 
-/* Apple's extension feature flags */
+/**
+ * HF feature flags */
+#define HFP_HF_FEAT_ECNR   (1 << 0)  /* EC and/or NR function */
+#define HFP_HF_FEAT_3WC    (1 << 1)  /* three-way calling */
+#define HFP_HF_FEAT_CLI    (1 << 2)  /* CLI presentation capability */
+#define HFP_HF_FEAT_VOICE  (1 << 3)  /* voice recognition activation */
+#define HFP_HF_FEAT_VOLUME (1 << 4)  /* remote volume control */
+#define HFP_HF_FEAT_ECS    (1 << 5)  /* enhanced call status */
+#define HFP_HF_FEAT_ECC    (1 << 6)  /* enhanced call control */
+#define HFP_HF_FEAT_CODEC  (1 << 7)  /* codec negotiation */
+#define HFP_HF_FEAT_HF_IND (1 << 8)  /* HF indicators */
+#define HFP_HF_FEAT_ESCO   (1 << 9)  /* enhanced SCO S4 settings supported */
+#define HFP_HF_FEAT_EVRS   (1 << 10) /* enhanced voice recognition status */
+#define HFP_HF_FEAT_VR_TXT (1 << 11) /* voice recognition text */
+
+/**
+ * Apple's extension feature flags */
 #define XAPL_FEATURE_BATTERY (1 << 1)
 #define XAPL_FEATURE_DOCKING (1 << 2)
 #define XAPL_FEATURE_SIRI    (1 << 3)
@@ -90,6 +116,7 @@ enum __attribute__ ((packed)) hfp_setup {
 	HFP_SETUP_GAIN_SPK,
 	HFP_SETUP_ACCESSORY_XAPL,
 	HFP_SETUP_ACCESSORY_BATT,
+	HFP_SETUP_SELECT_CODEC,
 	HFP_SETUP_COMPLETE,
 };
 
@@ -134,7 +161,10 @@ enum __attribute__ ((packed)) hfp_ind {
 /* a roaming is active */
 #define HFP_IND_ROAM_ACTIVE         1
 
-uint16_t hfp_codec_id_from_string(const char *alias);
-const char *hfp_codec_id_to_string(uint16_t codec_id);
+ssize_t hfp_ag_features_to_strings(uint32_t features, const char **out, size_t size);
+ssize_t hfp_hf_features_to_strings(uint32_t features, const char **out, size_t size);
+
+uint8_t hfp_codec_id_from_string(const char *alias);
+const char *hfp_codec_id_to_string(uint8_t codec_id);
 
 #endif

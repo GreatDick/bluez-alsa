@@ -1,6 +1,6 @@
 /*
  * test-msbc.c
- * Copyright (c) 2016-2022 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -21,10 +21,10 @@
 #include "shared/ffb.h"
 #include "shared/log.h"
 
+#include "inc/check.inc"
 #include "inc/sine.inc"
-#include "../src/codec-msbc.c"
 
-START_TEST(test_msbc_init) {
+CK_START_TEST(test_msbc_init) {
 
 	struct esco_msbc msbc = { .initialized = false };
 
@@ -41,55 +41,12 @@ START_TEST(test_msbc_init) {
 
 	msbc_finish(&msbc);
 
-} END_TEST
+} CK_END_TEST
 
-START_TEST(test_msbc_find_h2_header) {
-
-	static const uint8_t raw[][10] = {
-		{ 0 },
-		/* H2 header starts at first byte */
-		{ 0x01, 0x08, 0xad, 0x00, 0x00, 0xd5, 0x10, 0x00, 0x11, 0x10 },
-		/* H2 header starts at 5th byte */
-		{ 0x00, 0xd5, 0x10, 0x00, 0x01, 0x38, 0xad, 0x00, 0x11, 0x10 },
-		/* first H2 header starts at 2nd byte (second at 6th byte) */
-		{ 0xd5, 0x01, 0xc8, 0xad, 0x00, 0x01, 0xf8, 0xad, 0x11, 0x10 },
-		/* incorrect sequence number (bit not duplicated) */
-		{ 0x01, 0x18, 0xad, 0x00, 0x00, 0xd5, 0x10, 0x00, 0x11, 0x10 },
-		{ 0x01, 0x58, 0xad, 0x00, 0x00, 0xd5, 0x10, 0x00, 0x11, 0x10 },
-	};
-
-	size_t len;
-
-	len = sizeof(*raw);
-	ck_assert_ptr_eq(msbc_find_h2_header(raw[0], &len), NULL);
-	ck_assert_int_eq(len, 1);
-
-	len = sizeof(*raw);
-	ck_assert_ptr_eq(msbc_find_h2_header(raw[1], &len), (esco_h2_header_t *)&raw[1][0]);
-	ck_assert_int_eq(len, sizeof(*raw) - 0);
-
-	len = sizeof(*raw);
-	ck_assert_ptr_eq(msbc_find_h2_header(raw[2], &len), (esco_h2_header_t *)&raw[2][4]);
-	ck_assert_int_eq(len, sizeof(*raw) - 4);
-
-	len = sizeof(*raw);
-	ck_assert_ptr_eq(msbc_find_h2_header(raw[3], &len), (esco_h2_header_t *)&raw[3][1]);
-	ck_assert_int_eq(len, sizeof(*raw) - 1);
-
-	len = sizeof(*raw);
-	ck_assert_ptr_eq(msbc_find_h2_header(raw[4], &len), NULL);
-	ck_assert_int_eq(len, 1);
-
-	len = sizeof(*raw);
-	ck_assert_ptr_eq(msbc_find_h2_header(raw[5], &len), NULL);
-	ck_assert_int_eq(len, 1);
-
-} END_TEST
-
-START_TEST(test_msbc_encode_decode) {
+CK_START_TEST(test_msbc_encode_decode) {
 
 	int16_t sine[8 * MSBC_CODESAMPLES];
-	snd_pcm_sine_s16_2le(sine, ARRAYSIZE(sine), 1, 0, 1.0 / 128);
+	snd_pcm_sine_s16_2le(sine, 1, ARRAYSIZE(sine), 1.0 / 128, 0);
 
 	uint8_t data[sizeof(sine)];
 	uint8_t *data_tail = data;
@@ -142,16 +99,16 @@ START_TEST(test_msbc_encode_decode) {
 
 	}
 
-	ck_assert_int_eq(pcm_tail - pcm, 960);
+	ck_assert_int_eq(pcm_tail - pcm, 8 * MSBC_CODESAMPLES);
 
 	msbc_finish(&msbc);
 
-} END_TEST
+} CK_END_TEST
 
-START_TEST(test_msbc_decode_plc) {
+CK_START_TEST(test_msbc_decode_plc) {
 
 	int16_t sine[18 * MSBC_CODESAMPLES];
-	snd_pcm_sine_s16_2le(sine, ARRAYSIZE(sine), 1, 0, 1.0 / 128);
+	snd_pcm_sine_s16_2le(sine, 1, ARRAYSIZE(sine), 1.0 / 128, 0);
 
 	struct esco_msbc msbc = { .initialized = false };
 	ck_assert_int_eq(msbc_init(&msbc), 0);
@@ -159,7 +116,7 @@ START_TEST(test_msbc_decode_plc) {
 	uint8_t data[sizeof(sine)];
 	uint8_t *data_tail = data;
 
-	debug("Simulating mSBC packet loss events");
+	debug("Simulating eSCO packet loss events");
 
 	int rv;
 	size_t counter, i;
@@ -222,7 +179,7 @@ START_TEST(test_msbc_decode_plc) {
 
 	msbc_finish(&msbc);
 
-} END_TEST
+} CK_END_TEST
 
 int main(void) {
 
@@ -233,7 +190,6 @@ int main(void) {
 	suite_add_tcase(s, tc);
 
 	tcase_add_test(tc, test_msbc_init);
-	tcase_add_test(tc, test_msbc_find_h2_header);
 	tcase_add_test(tc, test_msbc_encode_decode);
 	tcase_add_test(tc, test_msbc_decode_plc);
 

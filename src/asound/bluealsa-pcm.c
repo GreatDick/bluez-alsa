@@ -1,6 +1,6 @@
 /*
- * bluealsa-pcm.c
- * Copyright (c) 2016-2021 Arkadiusz Bokowy
+ * BlueALSA - asound/bluealsa-pcm.c
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -17,6 +17,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,7 +26,7 @@
 #include <strings.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
-#include <time.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <alsa/asoundlib.h>
@@ -34,6 +35,7 @@
 #include <dbus/dbus.h>
 
 #include "shared/dbus-client.h"
+#include "shared/dbus-client-pcm.h"
 #include "shared/defs.h"
 #include "shared/hex.h"
 #include "shared/log.h"
@@ -43,11 +45,12 @@
 #define BA_PAUSE_STATE_PAUSED  (1 << 0)
 #define BA_PAUSE_STATE_PENDING (1 << 1)
 
-#if SND_LIB_VERSION >= 0x010104
+#if SND_LIB_VERSION >= 0x010104 && SND_LIB_VERSION < 0x010206
+#include <alloca.h>
 /**
- * alsa-lib releases from 1.1.4 have a bug in the rate plugin
- * which, when combined with the hw params refinement algorithm used by the
- * ioplug, can cause snd_pcm_avail() to return bogus values. This, in turn,
+ * alsa-lib releases from 1.1.4 to 1.2.5.1 inclusive have a bug in the rate
+ * plugin which, when combined with the hw params refinement algorithm used by
+ * the ioplug, can cause snd_pcm_avail() to return bogus values. This, in turn,
  * can trigger deadlock in applications built on the portaudio library
  * (e.g. audacity) and possibly cause faults in other applications too.
  *
@@ -69,23 +72,33 @@ struct bluealsa_pcm {
 
 	/* requested BlueALSA PCM */
 	struct ba_pcm ba_pcm;
-	size_t ba_pcm_buffer_size;
+	/* user-provided codec configuration */
+	uint8_t ba_pcm_codec_config[64];
+	size_t ba_pcm_codec_config_len;
+	/* additional supported codecs */
+	struct ba_pcm_codecs ba_pcm_codecs;
+
+	/* PCM FIFO */
 	int ba_pcm_fd;
+	/* PCM control socket */
 	int ba_pcm_ctrl_fd;
+
+	/* Indicates that the server is connected. */
+	atomic_bool connected;
 
 	/* event file descriptor */
 	int event_fd;
 
 	/* virtual hardware - ring buffer */
-	char *io_hw_buffer;
+	char * _Atomic io_hw_buffer;
 	/* The IO thread is responsible for maintaining the hardware pointer
 	 * (pcm->io_hw_ptr), the application is responsible for the application
-	 * pointer (io->appl_ptr). These are both volatile as they are both
+	 * pointer (io->appl_ptr). These pointers should be atomic as they are
 	 * written in one thread and read in the other. */
-	volatile snd_pcm_sframes_t io_hw_ptr;
-	snd_pcm_uframes_t io_hw_boundary;
+	_Atomic snd_pcm_sframes_t io_hw_ptr;
+	_Atomic snd_pcm_uframes_t io_hw_boundary;
 	/* Permit the application to modify the frequency of poll() events. */
-	volatile snd_pcm_uframes_t io_avail_min;
+	_Atomic snd_pcm_uframes_t io_avail_min;
 	pthread_t io_thread;
 	bool io_started;
 
@@ -140,27 +153,23 @@ static snd_pcm_uframes_t snd_pcm_ioplug_hw_avail(const snd_pcm_ioplug_t * const 
 #endif
 
 /**
- * Helper function for closing PCM transport. */
-static int close_transport(struct bluealsa_pcm *pcm) {
-	int rv = 0;
-	pthread_mutex_lock(&pcm->mutex);
-	if (pcm->ba_pcm_fd != -1) {
-		rv |= close(pcm->ba_pcm_fd);
-		pcm->ba_pcm_fd = -1;
-	}
-	if (pcm->ba_pcm_ctrl_fd != -1) {
-		rv |= close(pcm->ba_pcm_ctrl_fd);
-		pcm->ba_pcm_ctrl_fd = -1;
-	}
-	pthread_mutex_unlock(&pcm->mutex);
-	return rv;
+ * Helper function for terminating IO thread. */
+static void io_thread_cancel(struct bluealsa_pcm *pcm) {
+
+	if (!pcm->io_started)
+		return;
+
+	pthread_cancel(pcm->io_thread);
+	pthread_join(pcm->io_thread, NULL);
+	pcm->io_started = false;
+
 }
 
 /**
- * Helper function for IO thread termination. */
+ * Helper function for logging IO thread termination. */
 static void io_thread_cleanup(struct bluealsa_pcm *pcm) {
 	debug2("IO thread cleanup");
-	pcm->io_started = false;
+	(void)pcm;
 }
 
 /**
@@ -202,16 +211,15 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 	pthread_cleanup_push(PTHREAD_CLEANUP(io_thread_cleanup), pcm);
 
 	sigset_t sigset;
-	sigemptyset(&sigset);
-
-	/* Block signal, which will be used for pause/resume actions. */
-	sigaddset(&sigset, SIGIO);
-	/* Block SIGPIPE, so we could receive EPIPE while writing to the pipe
-	 * whose reading end has been closed. This will allow clean playback
-	 * termination. */
-	sigaddset(&sigset, SIGPIPE);
-
-	if ((errno = pthread_sigmask(SIG_BLOCK, &sigset, NULL)) != 0) {
+	/* Block all signals in the IO thread.
+	 * Especially, we need to block SIGPIPE, so we could receive EPIPE while
+	 * writing to the pipe which reading end was closed by the server. This
+	 * will allow clean playback termination. Also, we need to block SIGIO,
+	 * which is used for pause/resume actions. The rest of the signals are
+	 * blocked because we are using thread cancellation and we do not want
+	 * any interference from signal handlers. */
+	sigfillset(&sigset);
+	if ((errno = pthread_sigmask(SIG_SETMASK, &sigset, NULL)) != 0) {
 		SNDERR("Thread signal mask error: %s", strerror(errno));
 		goto fail;
 	}
@@ -227,14 +235,18 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 	debug2("Starting IO loop: %d", pcm->ba_pcm_fd);
 	for (;;) {
 
-		if (pcm->pause_state & BA_PAUSE_STATE_PENDING ||
+		pthread_mutex_lock(&pcm->mutex);
+		unsigned int is_pause_pending = pcm->pause_state & BA_PAUSE_STATE_PENDING;
+		pthread_mutex_unlock(&pcm->mutex);
+
+		if (is_pause_pending ||
 				pcm->io_hw_ptr == -1) {
 			debug2("Pausing IO thread");
 
 			pthread_mutex_lock(&pcm->mutex);
 			pcm->pause_state = BA_PAUSE_STATE_PAUSED;
-			pthread_cond_signal(&pcm->pause_cond);
 			pthread_mutex_unlock(&pcm->mutex);
+			pthread_cond_signal(&pcm->pause_cond);
 
 			int tmp;
 			sigwait(&sigset, &tmp);
@@ -247,8 +259,6 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 
 			if (pcm->io_hw_ptr == -1)
 				continue;
-			if (pcm->ba_pcm_fd == -1)
-				goto fail;
 
 			asrsync_init(&asrs, io->rate);
 			io_hw_ptr = pcm->io_hw_ptr;
@@ -275,65 +285,80 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 		if (frames > avail)
 			frames = avail;
 
-		/* When used with the rate plugin the buffer might contain a fractional
-		 * number of periods. So if the leftover in the buffer is less than a
-		 * whole period size, adjust the number of frames which should be
-		 * transferred.  */
-		if (io->buffer_size - offset < frames)
-			frames = io->buffer_size - offset;
-
-		/* IO operation size in bytes */
-		size_t len = frames * pcm->frame_size;
-		char *head = pcm->io_hw_buffer + offset * pcm->frame_size;
-
 		/* Increment the HW pointer (with boundary wrap). */
 		io_hw_ptr += frames;
 		if ((snd_pcm_uframes_t)io_hw_ptr >= pcm->io_hw_boundary)
 			io_hw_ptr -= pcm->io_hw_boundary;
 
-		ssize_t ret = 0;
-		if (io->stream == SND_PCM_STREAM_CAPTURE) {
+		/* When used with the rate plugin the buffer size may not be an
+		 * integer multiple of the period size. If so, the current period may
+		 * be split, part at the end of the buffer and the remainder at the
+		 * start. In this case we must perform the transfer in two chunks to
+		 * make up a full period.  */
+		snd_pcm_uframes_t chunk = frames;
+		if (io->buffer_size - offset < frames)
+			chunk = io->buffer_size - offset;
 
-			/* Read the whole period "atomically". This will assure, that frames
-			 * are not fragmented, so the pointer can be correctly updated. */
-			while (len != 0 && (ret = read(pcm->ba_pcm_fd, head, len)) != 0) {
-				if (ret == -1) {
-					if (errno == EINTR)
-						continue;
-					SNDERR("PCM FIFO read error: %s", strerror(errno));
+		snd_pcm_uframes_t frames_transfered = 0;
+		while (frames_transfered < frames) {
+
+			/* IO operation size in bytes */
+			size_t len = chunk * pcm->frame_size;
+			char *head = pcm->io_hw_buffer + offset * pcm->frame_size;
+
+			ssize_t ret = 0;
+			if (io->stream == SND_PCM_STREAM_CAPTURE) {
+
+				/* Read the whole chunk "atomically". This will assure, that
+				 * frames are not fragmented, so the pointer can be correctly
+				 * updated. */
+				while (len != 0 && (ret = read(pcm->ba_pcm_fd, head, len)) != 0) {
+					if (ret == -1) {
+						if (errno == EINTR)
+							continue;
+						SNDERR("PCM FIFO read error: %s", strerror(errno));
+						pcm->connected = false;
+						goto fail;
+					}
+					head += ret;
+					len -= ret;
+				}
+
+				if (ret == 0) {
+					pcm->connected = false;
 					goto fail;
 				}
-				head += ret;
-				len -= ret;
+
+			}
+			else {
+
+				/* Perform atomic write - see the explanation above. */
+				do {
+					if ((ret = write(pcm->ba_pcm_fd, head, len)) == -1) {
+						if (errno == EINTR)
+							continue;
+						if (errno != EPIPE)
+							SNDERR("PCM FIFO write error: %s", strerror(errno));
+						pcm->connected = false;
+						goto fail;
+					}
+					head += ret;
+					len -= ret;
+				} while (len != 0);
+
 			}
 
-			if (ret == 0)
-				goto fail;
-
-			io_thread_update_delay(pcm, io_hw_ptr);
+			frames_transfered += chunk;
+			offset = 0;
+			chunk = frames - chunk;
 
 		}
-		else {
 
-			/* Perform atomic write - see the explanation above. */
-			do {
-				if ((ret = write(pcm->ba_pcm_fd, head, len)) == -1) {
-					if (errno == EINTR)
-						continue;
-					if (errno != EPIPE)
-						SNDERR("PCM FIFO write error: %s", strerror(errno));
-					goto fail;
-				}
-				head += ret;
-				len -= ret;
-			} while (len != 0);
+		io_thread_update_delay(pcm, io_hw_ptr);
 
-			io_thread_update_delay(pcm, io_hw_ptr);
-
-			/* synchronize playback time */
+		/* synchronize playback time */
+		if (io->stream == SND_PCM_STREAM_PLAYBACK)
 			asrsync_sync(&asrs, frames);
-
-		}
 
 		/* Make the new HW pointer value visible to the ioplug. */
 		pcm->io_hw_ptr = io_hw_ptr;
@@ -341,14 +366,24 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 		/* Wake application thread if enough space/frames is available. */
 		if (frames + io->buffer_size - avail >= pcm->io_avail_min)
 			eventfd_write(pcm->event_fd, 1);
+
 	}
 
 fail:
-	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_pop(1);
-	close_transport(pcm);
-	eventfd_write(pcm->event_fd, 0xDEAD0000);
+
+	/* make sure we will not get stuck in the pause sync loop */
+	pthread_mutex_lock(&pcm->mutex);
+	pcm->pause_state = BA_PAUSE_STATE_PAUSED;
+	pthread_mutex_unlock(&pcm->mutex);
 	pthread_cond_signal(&pcm->pause_cond);
+
+	eventfd_write(pcm->event_fd, 0xDEAD0000);
+
+	/* wait for cancellation from main thread */
+	while (true)
+		sleep(3600);
+
+	pthread_cleanup_pop(1);
 	return NULL;
 }
 
@@ -364,9 +399,9 @@ static int bluealsa_start(snd_pcm_ioplug_t *io) {
 		return 0;
 	}
 
-	if (!bluealsa_dbus_pcm_ctrl_send_resume(pcm->ba_pcm_ctrl_fd, NULL)) {
+	if (!ba_dbus_pcm_ctrl_send_resume(pcm->ba_pcm_ctrl_fd, NULL)) {
 		debug2("Couldn't start PCM: %s", strerror(errno));
-		return -errno;
+		return -EIO;
 	}
 
 	/* Initialize delay calculation - capture reception begins immediately,
@@ -378,10 +413,10 @@ static int bluealsa_start(snd_pcm_ioplug_t *io) {
 	/* start the IO thread */
 	pcm->io_started = true;
 	if ((errno = pthread_create(&pcm->io_thread, NULL,
-					PTHREAD_ROUTINE(io_thread), io)) != 0) {
+					PTHREAD_FUNC(io_thread), io)) != 0) {
 		debug2("Couldn't create IO thread: %s", strerror(errno));
 		pcm->io_started = false;
-		return -errno;
+		return -EIO;
 	}
 
 	pthread_setname_np(pcm->io_thread, "pcm-io");
@@ -392,11 +427,7 @@ static int bluealsa_stop(snd_pcm_ioplug_t *io) {
 	struct bluealsa_pcm *pcm = io->private_data;
 	debug2("Stopping");
 
-	if (pcm->io_started) {
-		pcm->io_started = false;
-		pthread_cancel(pcm->io_thread);
-		pthread_join(pcm->io_thread, NULL);
-	}
+	io_thread_cancel(pcm);
 
 	pcm->delay_running = false;
 	pcm->delay_pcm_nread = 0;
@@ -406,8 +437,8 @@ static int bluealsa_stop(snd_pcm_ioplug_t *io) {
 	 * was stopped. */
 	pcm->io_hw_ptr = 0;
 
-	if (!bluealsa_dbus_pcm_ctrl_send_drop(pcm->ba_pcm_ctrl_fd, NULL))
-		return -errno;
+	if (!ba_dbus_pcm_ctrl_send_drop(pcm->ba_pcm_ctrl_fd, NULL))
+		return -EIO;
 
 	/* Applications that call poll() after snd_pcm_drain() will be blocked
 	 * forever unless we generate a poll() event here. */
@@ -429,7 +460,7 @@ static snd_pcm_sframes_t bluealsa_pointer(snd_pcm_ioplug_t *io) {
 	 * SND_PCM_STATE_DISCONNECTED after their internal call to
 	 * snd_pcm_avail_update(), which will be the case when we set it here.
 	 */
-	if (pcm->ba_pcm_fd == -1)
+	if (!pcm->connected)
 		snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
 
 #ifndef SND_PCM_IOPLUG_FLAG_BOUNDARY_WA
@@ -442,8 +473,10 @@ static snd_pcm_sframes_t bluealsa_pointer(snd_pcm_ioplug_t *io) {
 static int bluealsa_close(snd_pcm_ioplug_t *io) {
 	struct bluealsa_pcm *pcm = io->private_data;
 	debug2("Closing");
-	bluealsa_dbus_connection_ctx_free(&pcm->dbus_ctx);
-	close(pcm->event_fd);
+	ba_dbus_pcm_codecs_free(&pcm->ba_pcm_codecs);
+	ba_dbus_connection_ctx_free(&pcm->dbus_ctx);
+	if (pcm->event_fd != -1)
+		close(pcm->event_fd);
 	pthread_mutex_destroy(&pcm->mutex);
 	pthread_cond_destroy(&pcm->pause_cond);
 	free(pcm);
@@ -461,7 +494,7 @@ static int bluealsa_close(snd_pcm_ioplug_t *io) {
  * it has already been reduced to a single configuration, so is effectively
  * read-only. So in order to fix the problematic buffer size calculated by
  * the ioplug, we need to completely replace the hw_params container for
- * the bluealsa pcm.
+ * the bluealsa PCM.
  * */
 static int bluealsa_fix_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params) {
 #if DEBUG
@@ -532,14 +565,58 @@ static int bluealsa_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params)
 
 	debug2("Initializing HW");
 
-#if	BLUEALSA_HW_PARAMS_FIX
+	DBusError err = DBUS_ERROR_INIT;
+	int ret;
+
+	unsigned int channels;
+	if ((ret = snd_pcm_hw_params_get_channels(params, &channels)) < 0)
+		return ret;
+
+	unsigned int rate;
+	if ((ret = snd_pcm_hw_params_get_rate(params, &rate, NULL)) < 0)
+		return ret;
+
+	if (pcm->ba_pcm.channels != channels || pcm->ba_pcm.rate != rate) {
+		debug2("Changing BlueALSA PCM configuration: %u ch, %u Hz -> %u ch, %u Hz",
+				pcm->ba_pcm.channels, pcm->ba_pcm.rate, channels, rate);
+
+		const char *codec_name = pcm->ba_pcm.codec.name;
+		if (!ba_dbus_pcm_select_codec(&pcm->dbus_ctx, pcm->ba_pcm.pcm_path,
+				codec_name, pcm->ba_pcm_codec_config, pcm->ba_pcm_codec_config_len,
+				channels, rate, BA_PCM_SELECT_CODEC_FLAG_NONE, &err)) {
+			SNDERR("Couldn't change BlueALSA PCM configuration: %s", err.message);
+			return -dbus_error_to_errno(&err);
+		}
+
+		/* After new codec selection, it is necessary to update the PCM data.
+		 * We will do it the off-line manner (without server interaction) to
+		 * speed up the process. */
+
+		pcm->ba_pcm.channels = channels;
+		pcm->ba_pcm.rate = rate;
+
+		for (size_t i = 0; i < pcm->ba_pcm_codecs.codecs_len; i++) {
+			const struct ba_pcm_codec *codec = &pcm->ba_pcm_codecs.codecs[i];
+			if (strcmp(codec->name, codec_name) == 0) {
+				for (size_t j = 0; j < ARRAYSIZE(codec->channel_maps); j++)
+					if (codec->channels[j] == channels) {
+						memcpy(pcm->ba_pcm.channel_map, codec->channel_maps[j],
+								sizeof(pcm->ba_pcm.channel_map));
+						break;
+					}
+				break;
+			}
+		}
+
+	}
+
+#if BLUEALSA_HW_PARAMS_FIX
 	if (bluealsa_fix_hw_params(io, params) < 0)
 		debug2("Warning - unable to fix incorrect buffer size in hw parameters");
 #endif
 
 	snd_pcm_uframes_t period_size;
-	int ret;
-	if ((ret = snd_pcm_hw_params_get_period_size(params, &period_size, 0)) < 0)
+	if ((ret = snd_pcm_hw_params_get_period_size(params, &period_size, NULL)) < 0)
 		return ret;
 	snd_pcm_uframes_t buffer_size;
 	if ((ret = snd_pcm_hw_params_get_buffer_size(params, &buffer_size)) < 0)
@@ -547,13 +624,15 @@ static int bluealsa_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params)
 
 	pcm->frame_size = (snd_pcm_format_physical_width(io->format) * io->channels) / 8;
 
-	DBusError err = DBUS_ERROR_INIT;
-	if (!bluealsa_dbus_pcm_open(&pcm->dbus_ctx, pcm->ba_pcm.pcm_path,
+	if (!ba_dbus_pcm_open(&pcm->dbus_ctx, pcm->ba_pcm.pcm_path,
 				&pcm->ba_pcm_fd, &pcm->ba_pcm_ctrl_fd, &err)) {
 		debug2("Couldn't open PCM: %s", err.message);
+		ret = -dbus_error_to_errno(&err);
 		dbus_error_free(&err);
-		return -EBUSY;
+		return ret;
 	}
+
+	pcm->connected = true;
 
 	if (pcm->io.stream == SND_PCM_STREAM_PLAYBACK)
 		/* By default, the size of the pipe buffer is set to a too large value for
@@ -582,16 +661,31 @@ static int bluealsa_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params)
 static int bluealsa_hw_free(snd_pcm_ioplug_t *io) {
 	struct bluealsa_pcm *pcm = io->private_data;
 	debug2("Freeing HW");
-	if (close_transport(pcm) == -1)
-		return -errno;
-	return 0;
+
+	/* Before closing PCM transport make sure that
+	 * the IO thread is terminated. */
+	io_thread_cancel(pcm);
+
+	int rv = 0;
+	if (pcm->ba_pcm_fd != -1)
+		rv |= close(pcm->ba_pcm_fd);
+	if (pcm->ba_pcm_ctrl_fd != -1)
+		rv |= close(pcm->ba_pcm_ctrl_fd);
+
+	pcm->ba_pcm_fd = -1;
+	pcm->ba_pcm_ctrl_fd = -1;
+	pcm->connected = false;
+
+	return rv == 0 ? 0 : -errno;
 }
 
 static int bluealsa_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params) {
 	struct bluealsa_pcm *pcm = io->private_data;
 	debug2("Initializing SW");
 
-	snd_pcm_sw_params_get_boundary(params, &pcm->io_hw_boundary);
+	snd_pcm_uframes_t boundary;
+	snd_pcm_sw_params_get_boundary(params, &boundary);
+	pcm->io_hw_boundary = boundary;
 
 	snd_pcm_uframes_t avail_min;
 	snd_pcm_sw_params_get_avail_min(params, &avail_min);
@@ -607,7 +701,7 @@ static int bluealsa_prepare(snd_pcm_ioplug_t *io) {
 	struct bluealsa_pcm *pcm = io->private_data;
 
 	/* if PCM FIFO is not opened, report it right away */
-	if (pcm->ba_pcm_fd == -1) {
+	if (!pcm->connected) {
 		snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
 		return -ENODEV;
 	}
@@ -622,11 +716,20 @@ static int bluealsa_prepare(snd_pcm_ioplug_t *io) {
 	const snd_pcm_channel_area_t *areas = snd_pcm_ioplug_mmap_areas(io);
 	pcm->io_hw_buffer = (char *)areas->addr + areas->first / 8;
 
-	/* Indicate that our PCM is ready for IO, even though is is not 100%
-	 * true - the IO thread may not be running yet. Applications using
-	 * snd_pcm_sw_params_set_start_threshold() require the PCM to be usable
-	 * as soon as it has been prepared. */
-	eventfd_write(pcm->event_fd, 1);
+	if (io->stream == SND_PCM_STREAM_PLAYBACK) {
+		/* Indicate that our PCM is ready for IO, even though is is not 100%
+		 * true - the IO thread may not be running yet. Applications using
+		 * snd_pcm_sw_params_set_start_threshold() require the PCM to be usable
+		 * as soon as it has been prepared. */
+		if (pcm->io_avail_min < io->buffer_size)
+			eventfd_write(pcm->event_fd, 1);
+	}
+	else {
+		/* Make sure there is no poll event still pending (for example when
+		 * preparing after an overrun). */
+			eventfd_t event;
+			eventfd_read(pcm->event_fd, &event);
+	}
 
 	debug2("Prepared");
 	return 0;
@@ -634,11 +737,105 @@ static int bluealsa_prepare(snd_pcm_ioplug_t *io) {
 
 static int bluealsa_drain(snd_pcm_ioplug_t *io) {
 	struct bluealsa_pcm *pcm = io->private_data;
-	bluealsa_dbus_pcm_ctrl_send_drain(pcm->ba_pcm_ctrl_fd, NULL);
-	/* We cannot recover from an error here. By returning zero we ensure that
-	 * ioplug stops the pcm. Returning an error code would be interpreted by
-	 * ioplug as an incomplete drain and would it leave the pcm running. */
-	return 0;
+	debug2("Draining");
+
+	if (!pcm->connected) {
+		snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
+		return -ENODEV;
+	}
+
+	/* A bug in the ioplug drain implementation means that snd_pcm_drain()
+	 * always either finishes in state SND_PCM_STATE_SETUP or returns an error.
+	 * It is not possible to finish in state SND_PCM_STATE_DRAINING and return
+	 * success; therefore is is impossible to correctly implement capture
+	 * drain logic. So for capture PCMs we do nothing and return success;
+	 * ioplug will stop the PCM. */
+	if (io->stream == SND_PCM_STREAM_CAPTURE)
+		return 0;
+
+	/* We must ensure that all remaining frames in the ring buffer are flushed
+	 * to the FIFO by the I/O thread. It is possible that the client has called
+	 * snd_pcm_drain() without the start_threshold having been reached, or
+	 * while paused, so we must first ensure that the IO thread is running. */
+	if (bluealsa_start(io) < 0) {
+		/* Insufficient resources to start a new thread - so we have no choice
+		 * but to drop this stream. */
+		bluealsa_stop(io);
+		snd_pcm_ioplug_set_state(io, SND_PCM_STATE_SETUP);
+		return -EIO;
+	}
+
+	/* For a non-blocking drain, we do not wait for the drain to complete. */
+	if (io->nonblock)
+		return -EAGAIN;
+
+	struct pollfd pfd = { pcm->event_fd, POLLIN, 0 };
+	bool aborted = false;
+	int ret = 0;
+
+	snd_pcm_sframes_t hw_ptr;
+	while ((hw_ptr = bluealsa_pointer(io)) >= 0 && io->state == SND_PCM_STATE_DRAINING) {
+
+		snd_pcm_uframes_t avail = snd_pcm_ioplug_hw_avail(io, hw_ptr, io->appl_ptr);
+
+		/* If the buffer is empty then the local drain is complete. */
+		if (avail == 0)
+			break;
+
+		/* We set a timeout to ensure that the plugin cannot block forever in
+		 * case the server has stopped reading from the FIFO. Allow enough time
+		 * to drain the available frames as full periods, plus 100 ms:
+		 * e.g. one or less periods in buffer, allow 100ms + one period, more
+		 *      than one but not more than two, allow 100ms + two periods, etc.
+		 * If the wait is re-started after being interrupted by a signal then
+		 * we must re-calculate the maximum waiting time that remains. */
+		int timeout = 100 + (((avail - 1) / io->period_size) + 1) * io->period_size * 1000 / io->rate;
+
+		int nready = poll(&pfd, 1, timeout);
+		if (nready == -1) {
+			if (errno == EINTR) {
+				/* It is not well documented by ALSA, but if the application has
+				 * requested that the PCM should be aborted by a signal then the
+				 * ioplug nonblock flag is set to the special value 2. */
+				if (io->nonblock != 2)
+					continue;
+				/* Application has aborted the drain. */
+				debug2("Drain aborted by signal");
+				aborted = true;
+			}
+			else {
+				debug2("Drain poll error: %s", strerror(errno));
+				bluealsa_stop(io);
+				snd_pcm_ioplug_set_state(io, SND_PCM_STATE_SETUP);
+				ret = -EIO;
+			}
+
+			break;
+		}
+		if (nready == 0) {
+			/* Timeout - do not wait any longer. */
+			SNDERR("Drain timed out: Possible Bluetooth transport failure");
+			bluealsa_stop(io);
+			io->state = SND_PCM_STATE_SETUP;
+			ret = -EIO;
+			break;
+		}
+
+		if (pfd.revents & POLLIN) {
+			eventfd_t event;
+			eventfd_read(pcm->event_fd, &event);
+		}
+
+	}
+
+	if (io->state == SND_PCM_STATE_DRAINING && !aborted)
+		if (!ba_dbus_pcm_ctrl_send_drain(pcm->ba_pcm_ctrl_fd, NULL)) {
+			bluealsa_stop(io);
+			io->state = SND_PCM_STATE_SETUP;
+			ret = -EIO;
+		}
+
+	return ret;
 }
 
 /**
@@ -654,10 +851,6 @@ static snd_pcm_sframes_t bluealsa_calculate_delay(snd_pcm_ioplug_t *io) {
 
 	snd_pcm_sframes_t delay = 0;
 
-	/* if PCM is not started there should be no capture delay */
-	if (!pcm->delay_running && io->stream == SND_PCM_STREAM_CAPTURE)
-		return 0;
-
 	struct timespec now;
 	gettimestamp(&now);
 
@@ -672,11 +865,17 @@ static snd_pcm_sframes_t bluealsa_calculate_delay(snd_pcm_ioplug_t *io) {
 	 * dispatching was done more than one second ago - this should prioritize
 	 * asynchronous dispatching in the poll_revents() callback. */
 	if (pcm->dbus_dispatch_ts.tv_sec + 1 < now.tv_sec) {
-		bluealsa_dbus_connection_dispatch(&pcm->dbus_ctx);
+		ba_dbus_connection_dispatch(&pcm->dbus_ctx);
 		gettimestamp(&pcm->dbus_dispatch_ts);
 	}
 
 	pthread_mutex_lock(&pcm->mutex);
+
+	/* if PCM is not started there should be no capture delay */
+	if (!pcm->delay_running && io->stream == SND_PCM_STREAM_CAPTURE) {
+		pthread_mutex_unlock(&pcm->mutex);
+		return 0;
+	}
 
 	struct timespec diff;
 	timespecsub(&now, &pcm->delay_ts, &diff);
@@ -735,6 +934,8 @@ static snd_pcm_sframes_t bluealsa_calculate_delay(snd_pcm_ioplug_t *io) {
 
 	/* data transfer (communication) and encoding/decoding */
 	delay += (io->rate / 100) * pcm->ba_pcm.delay / 100;
+	/* additional delay specified by the client */
+	delay += (io->rate / 100) * pcm->ba_pcm.client_delay / 100;
 
 	delay += pcm->delay_ex;
 
@@ -749,14 +950,19 @@ static int bluealsa_pause(snd_pcm_ioplug_t *io, int enable) {
 		 * the server will not be paused while we are processing a transfer. */
 		pthread_mutex_lock(&pcm->mutex);
 		pcm->pause_state |= BA_PAUSE_STATE_PENDING;
-		while (!(pcm->pause_state & BA_PAUSE_STATE_PAUSED) && pcm->ba_pcm_fd != -1)
+		while (!(pcm->pause_state & BA_PAUSE_STATE_PAUSED) && pcm->connected)
 			pthread_cond_wait(&pcm->pause_cond, &pcm->mutex);
 		pthread_mutex_unlock(&pcm->mutex);
 	}
 
-	if (!bluealsa_dbus_pcm_ctrl_send(pcm->ba_pcm_ctrl_fd,
-				enable ? "Pause" : "Resume", NULL))
-		return -errno;
+	if (!pcm->connected) {
+		snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
+		return -ENODEV;
+	}
+
+	if (!ba_dbus_pcm_ctrl_send(pcm->ba_pcm_ctrl_fd,
+				enable ? "Pause" : "Resume", 200, NULL))
+		return -EIO;
 
 	if (enable == 0)
 		pthread_kill(pcm->io_thread, SIGIO);
@@ -781,7 +987,7 @@ static void bluealsa_dump(snd_pcm_ioplug_t *io, snd_output_t *out) {
 	/* alsa-lib commits the PCM setup only if bluealsa_hw_params() returned
 	 * success, so we only dump the ALSA PCM parameters if the BlueALSA PCM
 	 * connection is established. */
-	if (pcm->ba_pcm_fd >= 0) {
+	if (pcm->connected) {
 		snd_output_printf(out, "Its setup is:\n");
 		snd_pcm_dump_setup(io->pcm, out);
 	}
@@ -790,7 +996,7 @@ static void bluealsa_dump(snd_pcm_ioplug_t *io, snd_output_t *out) {
 static int bluealsa_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delayp) {
 	struct bluealsa_pcm *pcm = io->private_data;
 
-	if (pcm->ba_pcm_fd == -1) {
+	if (!pcm->connected) {
 		snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
 		return -ENODEV;
 	}
@@ -824,7 +1030,7 @@ static int bluealsa_poll_descriptors_count(snd_pcm_ioplug_t *io) {
 	struct bluealsa_pcm *pcm = io->private_data;
 
 	nfds_t dbus_nfds = 0;
-	bluealsa_dbus_connection_poll_fds(&pcm->dbus_ctx, NULL, &dbus_nfds);
+	ba_dbus_connection_poll_fds(&pcm->dbus_ctx, NULL, &dbus_nfds);
 
 	return 1 + dbus_nfds;
 }
@@ -833,8 +1039,11 @@ static int bluealsa_poll_descriptors(snd_pcm_ioplug_t *io, struct pollfd *pfd,
 		unsigned int nfds) {
 	struct bluealsa_pcm *pcm = io->private_data;
 
+	if (nfds < 1)
+		return -EINVAL;
+
 	nfds_t dbus_nfds = nfds - 1;
-	if (!bluealsa_dbus_connection_poll_fds(&pcm->dbus_ctx, &pfd[1], &dbus_nfds))
+	if (!ba_dbus_connection_poll_fds(&pcm->dbus_ctx, &pfd[1], &dbus_nfds))
 		return -EINVAL;
 
 	/* PCM plug-in relies on our internal event file descriptor. */
@@ -851,12 +1060,15 @@ static int bluealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
 	*revents = 0;
 	int ret = 0;
 
-	bluealsa_dbus_connection_poll_dispatch(&pcm->dbus_ctx, &pfd[1], nfds - 1);
+	if (nfds < 1)
+		return -EINVAL;
+
+	ba_dbus_connection_poll_dispatch(&pcm->dbus_ctx, &pfd[1], nfds - 1);
 	while (dbus_connection_dispatch(pcm->dbus_ctx.conn) == DBUS_DISPATCH_DATA_REMAINS)
 		continue;
 	gettimestamp(&pcm->dbus_dispatch_ts);
 
-	if (pcm->ba_pcm_fd == -1)
+	if (!pcm->connected)
 		goto fail;
 
 	if (pfd[0].revents & POLLIN) {
@@ -868,7 +1080,8 @@ static int bluealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
 			goto fail;
 
 		/* This call synchronizes the ring buffer pointers and updates the
-		 * ioplug state. */
+		 * ioplug state. For non-blocking drains it also causes ioplug to drop
+		 * the stream when the buffer is empty. */
 		snd_pcm_sframes_t avail = snd_pcm_avail(io->pcm);
 
 		/* ALSA expects that the event will match stream direction, e.g.
@@ -881,8 +1094,13 @@ static int bluealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
 
 		switch (io->state) {
 			case SND_PCM_STATE_SETUP:
+				/* To support non-blocking drain we must report a POLLOUT event
+				 * for playback PCMs here, because the above call to
+				 * snd_pcm_avail() may have changed the state to
+				 * SND_PCM_STATE_SETUP. */
+				if (io->stream == SND_PCM_STREAM_CAPTURE)
+					*revents = 0;
 				ready = false;
-				*revents = 0;
 				break;
 			case SND_PCM_STATE_PREPARED:
 				/* capture poll should block forever */
@@ -893,6 +1111,15 @@ static int bluealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
 				break;
 			case SND_PCM_STATE_RUNNING:
 				if ((snd_pcm_uframes_t)avail < pcm->io_avail_min) {
+					ready = false;
+					*revents = 0;
+				}
+				break;
+			case SND_PCM_STATE_DRAINING:
+				/* BlueALSA does not drain capture PCMs. So this state only
+				 * occurs with playback PCMs. Do not wake the application until
+				 * the buffer is empty. */
+				if ((snd_pcm_uframes_t)avail < io->buffer_size) {
 					ready = false;
 					*revents = 0;
 				}
@@ -925,6 +1152,78 @@ fail:
 	return -ENODEV;
 }
 
+static enum snd_pcm_chmap_position ba_channel_map_to_position(const char *tag) {
+
+	static const struct {
+		const char *tag;
+		enum snd_pcm_chmap_position pos;
+	} mapping[] = {
+		{ "MONO", SND_CHMAP_MONO },
+		{ "FL", SND_CHMAP_FL },
+		{ "FR", SND_CHMAP_FR },
+		{ "RL", SND_CHMAP_RL },
+		{ "RR", SND_CHMAP_RR },
+		{ "FC", SND_CHMAP_FC },
+		{ "LFE", SND_CHMAP_LFE },
+		{ "SL", SND_CHMAP_SL },
+		{ "SR", SND_CHMAP_SR },
+	};
+
+	for (size_t i = 0; i < ARRAYSIZE(mapping); i++)
+		if (strcmp(tag, mapping[i].tag) == 0)
+			return mapping[i].pos;
+	return SND_CHMAP_UNKNOWN;
+}
+
+static snd_pcm_chmap_query_t **bluealsa_query_chmaps(snd_pcm_ioplug_t *io) {
+	struct bluealsa_pcm *pcm = io->private_data;
+
+	const struct ba_pcm_codec *codec = &pcm->ba_pcm.codec;
+	for (size_t i = 0; i < pcm->ba_pcm_codecs.codecs_len; i++)
+		if (strcmp(pcm->ba_pcm_codecs.codecs[i].name, codec->name) == 0) {
+			codec = &pcm->ba_pcm_codecs.codecs[i];
+			break;
+		}
+
+	snd_pcm_chmap_query_t **maps;
+	if ((maps = malloc(sizeof(*maps) * (ARRAYSIZE(codec->channel_maps) + 1))) == NULL)
+		return NULL;
+
+	maps[ARRAYSIZE(codec->channel_maps)] = NULL;
+	for (size_t i = 0; i < ARRAYSIZE(codec->channel_maps); i++) {
+
+		unsigned int channels;
+		if ((channels = codec->channels[i]) == 0) {
+			maps[i] = NULL;
+			break;
+		}
+
+		maps[i] = malloc(sizeof(*maps[i]) + (channels * sizeof(*maps[i]->map.pos)));
+		maps[i]->type = SND_CHMAP_TYPE_FIXED;
+		maps[i]->map.channels = channels;
+
+		for (size_t j = 0; j < channels; j++)
+			maps[i]->map.pos[j] = ba_channel_map_to_position(codec->channel_maps[i][j]);
+
+	}
+
+	return maps;
+}
+
+static snd_pcm_chmap_t *bluealsa_get_chmap(snd_pcm_ioplug_t *io) {
+	struct bluealsa_pcm *pcm = io->private_data;
+
+	snd_pcm_chmap_t *map;
+	if ((map = malloc(sizeof(*map) + (io->channels * sizeof(*map->pos)))) == NULL)
+		return NULL;
+
+	map->channels = io->channels;
+	for (size_t i = 0; i < io->channels; i++)
+		map->pos[i] = ba_channel_map_to_position(pcm->ba_pcm.channel_map[i]);
+
+	return map;
+}
+
 static const snd_pcm_ioplug_callback_t bluealsa_callback = {
 	.start = bluealsa_start,
 	.stop = bluealsa_stop,
@@ -941,6 +1240,8 @@ static const snd_pcm_ioplug_callback_t bluealsa_callback = {
 	.poll_descriptors_count = bluealsa_poll_descriptors_count,
 	.poll_descriptors = bluealsa_poll_descriptors,
 	.poll_revents = bluealsa_poll_revents,
+	.query_chmaps = bluealsa_query_chmaps,
+	.get_chmap = bluealsa_get_chmap,
 };
 
 static int str2bdaddr(const char *str, bdaddr_t *ba) {
@@ -950,8 +1251,7 @@ static int str2bdaddr(const char *str, bdaddr_t *ba) {
 				&x[5], &x[4], &x[3], &x[2], &x[1], &x[0]) != 6)
 		return -1;
 
-	size_t i;
-	for (i = 0; i < 6; i++)
+	for (size_t i = 0; i < 6; i++)
 		ba->b[i] = x[i];
 
 	return 0;
@@ -963,6 +1263,41 @@ static int str2profile(const char *str) {
 	else if (strcasecmp(str, "sco") == 0)
 		return BA_PCM_TRANSPORT_HFP_AG | BA_PCM_TRANSPORT_HFP_HF |
 			BA_PCM_TRANSPORT_HSP_AG | BA_PCM_TRANSPORT_HSP_HS;
+	return 0;
+}
+
+/**
+ * Extract codec name and configuration from the codec string. */
+static int str2codec(const char *codec, char *name, size_t name_size,
+		uint8_t *config, size_t config_size, size_t *config_len) {
+
+	size_t name_len = strlen(codec);
+
+	char *delim;
+	/* Check for the delimiter which separates codec name and configuration. */
+	if ((delim = strchr(codec, ':')) != NULL) {
+
+		name_len = delim - codec;
+		delim++;
+
+		size_t config_hex_len;
+		if ((config_hex_len = strlen(delim)) > config_size * 2)
+			return -1;
+
+		ssize_t len;
+		if ((len = hex2bin(delim, config, config_hex_len)) == -1)
+			return -1;
+
+		*config_len = len;
+
+	}
+
+	if (name_len >= name_size)
+		return -1;
+
+	strncpy(name, codec, name_len);
+	name[name_len] = '\0';
+
 	return 0;
 }
 
@@ -1036,7 +1371,7 @@ static DBusHandlerResult bluealsa_dbus_msg_filter(DBusConnection *conn,
 	dbus_message_iter_next(&iter);
 
 	if (strcmp(updated_interface, BLUEALSA_INTERFACE_PCM) == 0)
-		bluealsa_dbus_message_iter_get_pcm_props(&iter, NULL, &pcm->ba_pcm);
+		dbus_message_iter_get_ba_pcm_props(&iter, NULL, &pcm->ba_pcm);
 
 	return DBUS_HANDLER_RESULT_HANDLED;
 }
@@ -1053,6 +1388,13 @@ static int bluealsa_set_hw_constraint(struct bluealsa_pcm *pcm) {
 
 	debug2("Setting constraints");
 
+	const struct ba_pcm_codec *codec = &pcm->ba_pcm.codec;
+	for (size_t i = 0; i < pcm->ba_pcm_codecs.codecs_len; i++)
+		if (strcmp(pcm->ba_pcm_codecs.codecs[i].name, codec->name) == 0) {
+			codec = &pcm->ba_pcm_codecs.codecs[i];
+			break;
+		}
+
 	if ((err = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_ACCESS,
 					ARRAYSIZE(accesses), accesses)) < 0)
 		return err;
@@ -1068,89 +1410,61 @@ static int bluealsa_set_hw_constraint(struct bluealsa_pcm *pcm) {
 
 	/* In order to prevent audio tearing and minimize CPU utilization, we're
 	 * going to setup period size constraint. The limit is derived from the
-	 * transport sampling rate and the number of channels, so the period
+	 * transport sample rate and the number of channels, so the period
 	 * "time" size will be constant, and should be about 10ms. The upper
 	 * limit will not be constrained. */
-	unsigned int min_p = pcm->ba_pcm.sampling / 100 * pcm->ba_pcm.channels *
+	unsigned int min_p = pcm->ba_pcm.rate / 100 * pcm->ba_pcm.channels *
 		snd_pcm_format_physical_width(get_snd_pcm_format(pcm->ba_pcm.format)) / 8;
 
 	if ((err = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_PERIOD_BYTES,
 					min_p, 1024 * 1024)) < 0)
 		return err;
 
-	if ((err = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_BUFFER_BYTES,
-					2 * min_p, 2 * 1024 * 1024)) < 0)
+	unsigned int list[ARRAYSIZE(codec->rates)];
+	unsigned int n;
+
+	/* Populate the list of supported channels and sample rates. For codecs
+	 * with fixed configuration, the list will contain only one element. For
+	 * other codecs, the list might contain all supported configurations. */
+
+	n = 0;
+	for (size_t i = 0; i < ARRAYSIZE(codec->channels) && codec->channels[i] != 0; i++)
+		list[n++] = codec->channels[i];
+	if ((err = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_CHANNELS, n, list)) < 0)
 		return err;
 
-	if ((err = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_CHANNELS,
-					pcm->ba_pcm.channels, pcm->ba_pcm.channels)) < 0)
-		return err;
-
-	if ((err = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_RATE,
-					pcm->ba_pcm.sampling, pcm->ba_pcm.sampling)) < 0)
+	n = 0;
+	for (size_t i = 0; i < ARRAYSIZE(codec->rates) && codec->rates[i] != 0; i++)
+		list[n++] = codec->rates[i];
+	if ((err = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_RATE, n, list)) < 0)
 		return err;
 
 	return 0;
 }
 
-static bool bluealsa_select_pcm_codec(struct bluealsa_pcm *pcm, const char *codec, DBusError *err) {
-
-	uint8_t config[64];
-	ssize_t config_len = 0;
-	bool ret = false;
-
-	char *codec_name;
-	if ((codec_name = strdup(codec)) == NULL) {
-		dbus_set_error(err, DBUS_ERROR_NO_MEMORY, NULL);
-		return false;
-	}
-
-	char *config_hex;
-	/* split the given string into name and configuration components */
-	if ((config_hex = strchr(codec_name, ':')) != NULL) {
-		*config_hex++ = '\0';
-
-		size_t config_hex_len;
-		if ((config_hex_len = strlen(config_hex)) > sizeof(config) * 2) {
-			dbus_set_error(err, DBUS_ERROR_FAILED, "Invalid codec configuration: %s", config_hex);
-			goto fail;
-		}
-		if ((config_len = hex2bin(config_hex, config, config_hex_len)) == -1) {
-			dbus_set_error(err, DBUS_ERROR_FAILED, "%s", strerror(errno));
-			goto fail;
-		}
-
-	}
-
-	if (!bluealsa_dbus_pcm_select_codec(&pcm->dbus_ctx, pcm->ba_pcm.pcm_path,
-				bluealsa_dbus_pcm_get_codec_canonical_name(codec_name), config, config_len, err))
-		goto fail;
-
-	ret = true;
-
-fail:
-	free(codec_name);
-	return ret;
-}
-
 static bool bluealsa_update_pcm_volume(struct bluealsa_pcm *pcm,
 		int volume, int mute, DBusError *err) {
-	uint16_t old = pcm->ba_pcm.volume.raw;
+
+	uint8_t old[ARRAYSIZE(pcm->ba_pcm.volume)];
+	memcpy(old, pcm->ba_pcm.volume, sizeof(old));
+
 	if (volume >= 0) {
 		const int v = BA_PCM_VOLUME_MAX(&pcm->ba_pcm) * volume / 100;
-		pcm->ba_pcm.volume.ch1_volume = v;
-		if (pcm->ba_pcm.channels == 2)
-			pcm->ba_pcm.volume.ch2_volume = v;
+		for (size_t i = 0; i < pcm->ba_pcm.channels; i++)
+			pcm->ba_pcm.volume[i].volume = v;
 	}
+
 	if (mute >= 0) {
 		const bool v = !!mute;
-		pcm->ba_pcm.volume.ch1_muted = v;
-		if (pcm->ba_pcm.channels == 2)
-			pcm->ba_pcm.volume.ch2_muted = v;
+		for (size_t i = 0; i < pcm->ba_pcm.channels; i++)
+			pcm->ba_pcm.volume[i].muted = v;
 	}
-	if (pcm->ba_pcm.volume.raw == old)
+
+	/* check whether update is required */
+	if (memcmp(pcm->ba_pcm.volume, old, sizeof(old)) == 0)
 		return true;
-	return bluealsa_dbus_pcm_update(&pcm->dbus_ctx, &pcm->ba_pcm, BLUEALSA_PCM_VOLUME, err);
+
+	return ba_dbus_pcm_update(&pcm->dbus_ctx, &pcm->ba_pcm, BLUEALSA_PCM_VOLUME, err);
 }
 
 static bool bluealsa_update_pcm_softvol(struct bluealsa_pcm *pcm,
@@ -1158,7 +1472,7 @@ static bool bluealsa_update_pcm_softvol(struct bluealsa_pcm *pcm,
 	if (softvol < 0 || !!softvol == pcm->ba_pcm.soft_volume)
 		return true;
 	pcm->ba_pcm.soft_volume = !!softvol;
-	return bluealsa_dbus_pcm_update(&pcm->dbus_ctx, &pcm->ba_pcm, BLUEALSA_PCM_SOFT_VOLUME, err);
+	return ba_dbus_pcm_update(&pcm->dbus_ctx, &pcm->ba_pcm, BLUEALSA_PCM_SOFT_VOLUME, err);
 }
 
 SND_PCM_PLUGIN_DEFINE_FUNC(bluealsa) {
@@ -1259,6 +1573,15 @@ SND_PCM_PLUGIN_DEFINE_FUNC(bluealsa) {
 		return -EINVAL;
 	}
 
+	char codec_name[32] = "";
+	uint8_t codec_config[sizeof(pcm->ba_pcm_codec_config)];
+	size_t codec_config_len = 0;
+	if (codec != NULL && str2codec(codec, codec_name, sizeof(codec_name),
+				codec_config, sizeof(codec_config), &codec_config_len) == -1) {
+		SNDERR("Invalid codec: %s", codec);
+		return -EINVAL;
+	}
+
 	int pcm_mute = -1;
 	int pcm_volume = -1;
 	if (volume != NULL && str2volume(volume, &pcm_volume, &pcm_mute) != 0) {
@@ -1275,6 +1598,16 @@ SND_PCM_PLUGIN_DEFINE_FUNC(bluealsa) {
 	if ((pcm = calloc(1, sizeof(*pcm))) == NULL)
 		return -ENOMEM;
 
+	pcm->io.version = SND_PCM_IOPLUG_VERSION;
+	pcm->io.name = "BlueALSA";
+	pcm->io.flags = SND_PCM_IOPLUG_FLAG_LISTED;
+#ifdef SND_PCM_IOPLUG_FLAG_BOUNDARY_WA
+	pcm->io.flags |= SND_PCM_IOPLUG_FLAG_BOUNDARY_WA;
+#endif
+	pcm->io.mmap_rw = 1;
+	pcm->io.callback = &bluealsa_callback;
+	pcm->io.private_data = pcm;
+
 	pcm->event_fd = -1;
 	pcm->ba_pcm_fd = -1;
 	pcm->ba_pcm_ctrl_fd = -1;
@@ -1286,9 +1619,9 @@ SND_PCM_PLUGIN_DEFINE_FUNC(bluealsa) {
 	dbus_threads_init_default();
 
 	DBusError err = DBUS_ERROR_INIT;
-	if (bluealsa_dbus_connection_ctx_init(&pcm->dbus_ctx, service, &err) != TRUE) {
+	if (ba_dbus_connection_ctx_init(&pcm->dbus_ctx, service, &err) != TRUE) {
 		SNDERR("Couldn't initialize D-Bus context: %s", err.message);
-		ret = -ENOMEM;
+		ret = -dbus_error_to_errno(&err);
 		goto fail;
 	}
 
@@ -1299,33 +1632,58 @@ SND_PCM_PLUGIN_DEFINE_FUNC(bluealsa) {
 	}
 
 	debug("Getting BlueALSA PCM: %s %s %s", snd_pcm_stream_name(stream), device, profile);
-	if (!bluealsa_dbus_get_pcm(&pcm->dbus_ctx, &ba_addr, ba_profile,
+	if (!ba_dbus_pcm_get(&pcm->dbus_ctx, &ba_addr, ba_profile,
 				stream == SND_PCM_STREAM_PLAYBACK ? BA_PCM_MODE_SINK : BA_PCM_MODE_SOURCE,
 				&pcm->ba_pcm, &err)) {
 		SNDERR("Couldn't get BlueALSA PCM: %s", err.message);
-		ret = -ENODEV;
+		ret = -dbus_error_to_errno(&err);
 		goto fail;
 	}
 
 	/* Subscribe for properties-changed signals but for the opened PCM only. */
-	bluealsa_dbus_connection_signal_match_add(&pcm->dbus_ctx, pcm->dbus_ctx.ba_service,
+	ba_dbus_connection_signal_match_add(&pcm->dbus_ctx, pcm->dbus_ctx.ba_service,
 			pcm->ba_pcm.pcm_path, DBUS_INTERFACE_PROPERTIES, "PropertiesChanged",
 			"arg0='"BLUEALSA_INTERFACE_PCM"'");
 
-	if ((pcm->event_fd = eventfd(0, EFD_CLOEXEC)) == -1) {
+	if ((pcm->event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) == -1) {
 		ret = -errno;
 		goto fail;
 	}
 
-	pcm->io.version = SND_PCM_IOPLUG_VERSION;
-	pcm->io.name = "BlueALSA";
-	pcm->io.flags = SND_PCM_IOPLUG_FLAG_LISTED;
-#ifdef SND_PCM_IOPLUG_FLAG_BOUNDARY_WA
-	pcm->io.flags |= SND_PCM_IOPLUG_FLAG_BOUNDARY_WA;
-#endif
-	pcm->io.mmap_rw = 1;
-	pcm->io.callback = &bluealsa_callback;
-	pcm->io.private_data = pcm;
+	if (codec_name[0] != '\0') {
+		/* If the codec was given, change it now, so we can get the correct
+		 * sample rate and channels for HW constraints. */
+		const char *canonical = ba_dbus_pcm_codec_get_canonical_name(codec_name);
+		const bool name_changed = strcmp(canonical, pcm->ba_pcm.codec.name) != 0;
+		if (name_changed && !ba_dbus_pcm_select_codec(&pcm->dbus_ctx, pcm->ba_pcm.pcm_path,
+					canonical, NULL, 0, 0, 0, BA_PCM_SELECT_CODEC_FLAG_NONE, &err)) {
+			SNDERR("Couldn't select BlueALSA PCM codec: %s", err.message);
+			dbus_error_free(&err);
+		}
+		else {
+
+			memcpy(pcm->ba_pcm_codec_config, codec_config, codec_config_len);
+			pcm->ba_pcm_codec_config_len = codec_config_len;
+
+			/* Changing the codec may change the audio format, sample rate and/or
+			 * channels. We need to refresh our cache of PCM properties. */
+			if (name_changed && !ba_dbus_pcm_get(&pcm->dbus_ctx, &ba_addr, ba_profile,
+						stream == SND_PCM_STREAM_PLAYBACK ? BA_PCM_MODE_SINK : BA_PCM_MODE_SOURCE,
+						&pcm->ba_pcm, &err)) {
+				SNDERR("Couldn't get BlueALSA PCM: %s", err.message);
+				ret = -dbus_error_to_errno(&err);
+				goto fail;
+			}
+
+		}
+	}
+
+	/* If the BT transport codec is not known (which means that PCM sample
+	 * rate is also not know), we cannot construct useful constraints. */
+	if (pcm->ba_pcm.rate == 0) {
+		ret = -EAGAIN;
+		goto fail;
+	}
 
 #if SND_LIB_VERSION >= 0x010102 && SND_LIB_VERSION <= 0x010103
 	/* ALSA library thread-safe API functionality does not play well with ALSA
@@ -1338,27 +1696,13 @@ SND_PCM_PLUGIN_DEFINE_FUNC(bluealsa) {
 	if ((ret = snd_pcm_ioplug_create(&pcm->io, name, stream, mode)) < 0)
 		goto fail;
 
-	if (codec != NULL && codec[0] != '\0') {
-		if (bluealsa_select_pcm_codec(pcm, codec, &err)) {
-			/* Changing the codec may change the audio format, sampling rate and/or
-			 * channels. We need to refresh our cache of PCM properties. */
-			if (!bluealsa_dbus_get_pcm(&pcm->dbus_ctx, &ba_addr, ba_profile,
-						stream == SND_PCM_STREAM_PLAYBACK ? BA_PCM_MODE_SINK : BA_PCM_MODE_SOURCE,
-						&pcm->ba_pcm, &err)) {
-				SNDERR("Couldn't get BlueALSA PCM: %s", err.message);
-				ret = -ENODEV;
-				goto fail;
-			}
-		}
-		else {
-			SNDERR("Couldn't select BlueALSA PCM codec: %s", err.message);
-			dbus_error_free(&err);
-		}
-	}
+	if (!ba_dbus_pcm_codecs_get(&pcm->dbus_ctx, pcm->ba_pcm.pcm_path,
+				&pcm->ba_pcm_codecs, &err))
+		SNDERR("Couldn't get BlueALSA PCM codecs: %s", err.message);
 
 	if ((ret = bluealsa_set_hw_constraint(pcm)) < 0) {
 		snd_pcm_ioplug_delete(&pcm->io);
-		return ret;
+		goto fail;
 	}
 
 	if (!bluealsa_update_pcm_softvol(pcm, pcm_softvol, &err)) {
@@ -1375,11 +1719,8 @@ SND_PCM_PLUGIN_DEFINE_FUNC(bluealsa) {
 	return 0;
 
 fail:
-	bluealsa_dbus_connection_ctx_free(&pcm->dbus_ctx);
+	bluealsa_close(&pcm->io);
 	dbus_error_free(&err);
-	if (pcm->event_fd != -1)
-		close(pcm->event_fd);
-	free(pcm);
 	return ret;
 }
 

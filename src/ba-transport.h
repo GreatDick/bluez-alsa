@@ -1,6 +1,6 @@
 /*
  * BlueALSA - ba-transport.h
- * Copyright (c) 2016-2021 Arkadiusz Bokowy
+ * Copyright (c) 2016-2023 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -20,20 +20,36 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
+
+#include <alsa/asoundlib.h>
+#include <glib.h>
 
 #include "a2dp.h"
 #include "ba-device.h"
-#include "ba-rfcomm.h"
+#include "ba-transport-pcm.h"
+#include "ble-midi.h"
 #include "bluez.h"
 #include "shared/a2dp-codecs.h"
 
-#define BA_TRANSPORT_PROFILE_NONE        (0)
-#define BA_TRANSPORT_PROFILE_A2DP_SOURCE (1 << 0)
-#define BA_TRANSPORT_PROFILE_A2DP_SINK   (2 << 0)
-#define BA_TRANSPORT_PROFILE_HFP_HF      (1 << 2)
-#define BA_TRANSPORT_PROFILE_HFP_AG      (2 << 2)
-#define BA_TRANSPORT_PROFILE_HSP_HS      (1 << 4)
-#define BA_TRANSPORT_PROFILE_HSP_AG      (2 << 4)
+enum ba_transport_thread_manager_command {
+	BA_TRANSPORT_THREAD_MANAGER_TERMINATE = 0,
+	BA_TRANSPORT_THREAD_MANAGER_CANCEL_THREADS,
+	BA_TRANSPORT_THREAD_MANAGER_CANCEL_IF_NO_CLIENTS,
+};
+
+enum ba_transport_profile {
+	BA_TRANSPORT_PROFILE_NONE        = 0,
+	BA_TRANSPORT_PROFILE_A2DP_SOURCE = (1 << 0),
+	BA_TRANSPORT_PROFILE_A2DP_SINK   = (2 << 0),
+	BA_TRANSPORT_PROFILE_HFP_HF      = (1 << 2),
+	BA_TRANSPORT_PROFILE_HFP_AG      = (2 << 2),
+	BA_TRANSPORT_PROFILE_HSP_HS      = (1 << 4),
+	BA_TRANSPORT_PROFILE_HSP_AG      = (2 << 4),
+#if ENABLE_MIDI
+	BA_TRANSPORT_PROFILE_MIDI        = (1 << 6),
+#endif
+};
 
 #define BA_TRANSPORT_PROFILE_MASK_A2DP \
 	(BA_TRANSPORT_PROFILE_A2DP_SOURCE | BA_TRANSPORT_PROFILE_A2DP_SINK)
@@ -48,190 +64,23 @@
 #define BA_TRANSPORT_PROFILE_MASK_HF \
 	(BA_TRANSPORT_PROFILE_HSP_HS | BA_TRANSPORT_PROFILE_HFP_HF)
 
-/**
- * Selected profile and audio codec.
- *
- * For A2DP vendor codecs the upper byte of the codec field
- * contains the lowest byte of the vendor ID. */
-struct ba_transport_type {
-	uint16_t profile;
-	uint16_t codec;
-};
-
-enum ba_transport_pcm_mode {
-	/* PCM used for capturing audio */
-	BA_TRANSPORT_PCM_MODE_SOURCE,
-	/* PCM used for playing audio */
-	BA_TRANSPORT_PCM_MODE_SINK,
-};
-
-/**
- * Builder for 16-bit PCM stream format identifier. */
-#define BA_TRANSPORT_PCM_FORMAT(sign, width, bytes, endian) \
-	(((sign & 1) << 15) | ((endian & 1) << 14) | ((bytes & 0x3F) << 8) | (width & 0xFF))
-
-#define BA_TRANSPORT_PCM_FORMAT_SIGN(format)   (((format) >> 15) & 0x1)
-#define BA_TRANSPORT_PCM_FORMAT_WIDTH(format)  ((format) & 0xFF)
-#define BA_TRANSPORT_PCM_FORMAT_BYTES(format)  (((format) >> 8) & 0x3F)
-#define BA_TRANSPORT_PCM_FORMAT_ENDIAN(format) (((format) >> 14) & 0x1)
-
-#define BA_TRANSPORT_PCM_FORMAT_U8      BA_TRANSPORT_PCM_FORMAT(0, 8, 1, 0)
-#define BA_TRANSPORT_PCM_FORMAT_S16_2LE BA_TRANSPORT_PCM_FORMAT(1, 16, 2, 0)
-#define BA_TRANSPORT_PCM_FORMAT_S24_3LE BA_TRANSPORT_PCM_FORMAT(1, 24, 3, 0)
-#define BA_TRANSPORT_PCM_FORMAT_S24_4LE BA_TRANSPORT_PCM_FORMAT(1, 24, 4, 0)
-#define BA_TRANSPORT_PCM_FORMAT_S32_4LE BA_TRANSPORT_PCM_FORMAT(1, 32, 4, 0)
-
-struct ba_transport_pcm {
-
-	/* backward reference to transport */
-	struct ba_transport *t;
-	/* associated transport thread */
-	struct ba_transport_thread *th;
-
-	/* PCM stream operation mode */
-	enum ba_transport_pcm_mode mode;
-
-	/* PCM access guard */
-	pthread_mutex_t mutex;
-
-	/* FIFO file descriptor */
-	int fd;
-
-	/* indicates whether PCM shall be active */
-	bool active;
-
-	/* 16-bit stream format identifier */
-	uint16_t format;
-	/* number of audio channels */
-	unsigned int channels;
-	/* PCM sampling frequency */
-	unsigned int sampling;
-
-	/* Overall PCM delay in 1/10 of millisecond, caused by
-	 * audio encoding or decoding and data transfer. */
-	unsigned int delay;
-
-	/* internal software volume control */
-	bool soft_volume;
-
-	/* maximal possible Bluetooth volume */
-	unsigned int max_bt_volume;
-
-	/* Volume configuration for channel left [0] and right [1]. In case of
-	 * a monophonic sound, only the left [0] channel shall be used. */
-	struct ba_transport_pcm_volume {
-		/* volume level change in "dB * 100" */
-		int level;
-		/* audio signal mute switches */
-		bool soft_mute;
-		bool hard_mute;
-		/* calculated PCM scale factor based on decibel formula
-		 * pow(10, dB / 20); for muted channel it shall equal 0 */
-		double scale;
-	} volume[2];
-
-	/* data synchronization */
-	pthread_mutex_t synced_mtx;
-	pthread_cond_t synced;
-
-	/* exported PCM D-Bus API */
-	char *ba_dbus_path;
-	bool ba_dbus_exported;
-
-};
-
-void ba_transport_pcm_volume_set(
-		struct ba_transport_pcm_volume *volume,
-		const int *level,
-		const bool *soft_mute,
-		const bool *hard_mute);
-
-enum ba_transport_thread_state {
-	BA_TRANSPORT_THREAD_STATE_NONE,
-	BA_TRANSPORT_THREAD_STATE_STARTING,
-	BA_TRANSPORT_THREAD_STATE_RUNNING,
-	BA_TRANSPORT_THREAD_STATE_STOPPING,
-};
-
-enum ba_transport_thread_signal {
-	BA_TRANSPORT_THREAD_SIGNAL_PING,
-	BA_TRANSPORT_THREAD_SIGNAL_PCM_OPEN,
-	BA_TRANSPORT_THREAD_SIGNAL_PCM_CLOSE,
-	BA_TRANSPORT_THREAD_SIGNAL_PCM_PAUSE,
-	BA_TRANSPORT_THREAD_SIGNAL_PCM_RESUME,
-	BA_TRANSPORT_THREAD_SIGNAL_PCM_SYNC,
-	BA_TRANSPORT_THREAD_SIGNAL_PCM_DROP,
-};
-
-struct ba_transport_thread {
-
-	/* backward reference to transport */
-	struct ba_transport *t;
-
-	/* guard thread structure */
-	pthread_mutex_t mutex;
-
-	/* guard thread state */
-	pthread_mutex_t state_mtx;
-	/* current state of the thread */
-	enum ba_transport_thread_state state;
-
-	/* actual thread ID */
-	pthread_t id;
-	/* indicates a master thread */
-	bool master;
-	/* clone of BT socket */
-	int bt_fd;
-	/* notification PIPE */
-	int pipe[2];
-
-	/* state/id changed notification */
-	pthread_cond_t changed;
-
-};
-
-int ba_transport_thread_set_state(
-		struct ba_transport_thread *th,
-		enum ba_transport_thread_state state,
-		bool force);
-
-#define ba_transport_thread_set_state_starting(th) \
-	ba_transport_thread_set_state(th, BA_TRANSPORT_THREAD_STATE_STARTING, false)
-#define ba_transport_thread_set_state_running(th) \
-	ba_transport_thread_set_state(th, BA_TRANSPORT_THREAD_STATE_RUNNING, false)
-#define ba_transport_thread_set_state_stopping(th) \
-	ba_transport_thread_set_state(th, BA_TRANSPORT_THREAD_STATE_STOPPING, false)
-
-int ba_transport_thread_bt_acquire(
-		struct ba_transport_thread *th);
-int ba_transport_thread_bt_release(
-		struct ba_transport_thread *th);
-
-int ba_transport_thread_signal_send(
-		struct ba_transport_thread *th,
-		enum ba_transport_thread_signal signal);
-int ba_transport_thread_signal_recv(
-		struct ba_transport_thread *th,
-		enum ba_transport_thread_signal *signal);
-
-enum ba_transport_thread_manager_command {
-	BA_TRANSPORT_THREAD_MANAGER_TERMINATE = 0,
-	BA_TRANSPORT_THREAD_MANAGER_CANCEL_THREADS,
-	BA_TRANSPORT_THREAD_MANAGER_CANCEL_IF_NO_CLIENTS,
-};
-
 struct ba_transport {
 
 	/* backward reference to device */
 	struct ba_device *d;
 
-	/* guard modifications of transport type, e.g. codec */
-	pthread_mutex_t type_mtx;
-
 	/* Transport structure covers all transports supported by BlueALSA. However,
 	 * every transport requires specific handling - link acquisition, transport
 	 * specific configuration, freeing resources, etc. */
-	struct ba_transport_type type;
+	enum ba_transport_profile profile;
+
+	/* guard modifications of transport codec */
+	pthread_mutex_t codec_id_mtx;
+	/* ID of currently selected codec */
+	uint32_t codec_id;
+
+	/* synchronization for codec selection */
+	pthread_mutex_t codec_select_client_mtx;
 
 	/* data for D-Bus management */
 	char *bluez_dbus_owner;
@@ -240,6 +89,10 @@ struct ba_transport {
 	/* guard modifications of our file descriptor
 	 * and the IO threads stopping flag */
 	pthread_mutex_t bt_fd_mtx;
+
+	/* Ensure BT file descriptor acquisition procedure
+	 * is completed atomically. */
+	pthread_mutex_t acquisition_mtx;
 
 	/* This field stores a file descriptor (socket) associated with the BlueZ
 	 * side of the transport. The role of this socket depends on the transport
@@ -250,16 +103,12 @@ struct ba_transport {
 	size_t mtu_read;
 	size_t mtu_write;
 
-	/* threads for audio processing */
-	struct ba_transport_thread thread_enc;
-	struct ba_transport_thread thread_dec;
-
 	/* thread for managing IO threads */
 	pthread_t thread_manager_thread_id;
 	int thread_manager_pipe[2];
 
 	/* indicates IO threads stopping */
-	pthread_cond_t stopped;
+	pthread_cond_t stopped_cond;
 	bool stopping;
 
 	union {
@@ -270,13 +119,16 @@ struct ba_transport {
 			const char *bluez_dbus_sep_path;
 
 			/* current state of the transport */
+			pthread_cond_t state_changed_cond;
 			enum bluez_a2dp_transport_state state;
 
-			/* audio codec configuration capabilities */
-			const struct a2dp_codec *codec;
+			/* SEP configuration */
+			const struct a2dp_sep *sep;
 			/* selected audio codec configuration */
 			a2dp_t configuration;
 
+			/* delay reporting support */
+			bool delay_reporting;
 			/* delay reported by BlueZ */
 			uint16_t delay;
 			/* volume reported by BlueZ */
@@ -297,19 +149,62 @@ struct ba_transport {
 
 		struct {
 
-			/* associated RFCOMM thread */
+			/* Associated RFCOMM thread for SCO transport handled by local
+			 * HSP/HFP implementation. Otherwise, this field is set to NULL. */
 			struct ba_rfcomm *rfcomm;
+
+#if ENABLE_OFONO
+			/* Associated oFono card and modem paths. In case when SCO transport
+			 * is not oFono-based, these fields are set to NULL. */
+			char *ofono_dbus_path_card;
+			char *ofono_dbus_path_modem;
+#endif
 
 			/* Speaker and microphone signals should to be exposed as
 			 * a separate PCM devices. Hence, there is a requirement
-			 * for separate configurations. */
-			struct ba_transport_pcm spk_pcm;
-			struct ba_transport_pcm mic_pcm;
+			 * for separate configurations.
+			 *
+			 * NOTE: The speaker/microphone notation always refers to the whole
+			 *       AG/HS setup. For AG the speaker is an outgoing audio stream,
+			 *       while for HS the speaker is an incoming audio stream. */
+			struct ba_transport_pcm pcm_spk;
+			struct ba_transport_pcm pcm_mic;
 
 			/* time-stamp when the SCO link has been closed */
 			struct timespec closed_at;
 
 		} sco;
+
+#if ENABLE_MIDI
+		struct {
+
+			/* ALSA sequencer. */
+			snd_seq_t *seq;
+			/* Associated sequencer port. */
+			int seq_port;
+			/* Associated scheduling queue. */
+			int seq_queue;
+
+			/* ALSA MIDI event parser. */
+			snd_midi_event_t *seq_parser;
+
+			/* BLE-MIDI input link */
+			int ble_fd_write;
+			/* BLE-MIDI output (notification) link */
+			int ble_fd_notify;
+
+			/* BLE-MIDI parser for the incoming data. */
+			struct ble_midi_dec ble_decoder;
+			/* BLE-MIDI parser for the outgoing data. */
+			struct ble_midi_enc ble_encoder;
+
+			/* Watch associated with the BLE-MIDI link. */
+			GSource *watch_ble;
+			/* Watch associated with ALSA sequencer. */
+			GSource *watch_seq;
+
+		} midi;
+#endif
 
 	};
 
@@ -324,20 +219,32 @@ struct ba_transport {
 
 struct ba_transport *ba_transport_new_a2dp(
 		struct ba_device *device,
-		struct ba_transport_type type,
+		enum ba_transport_profile profile,
 		const char *dbus_owner,
 		const char *dbus_path,
-		const struct a2dp_codec *codec,
+		const struct a2dp_sep *sep,
 		const void *configuration);
 struct ba_transport *ba_transport_new_sco(
 		struct ba_device *device,
-		struct ba_transport_type type,
+		enum ba_transport_profile profile,
 		const char *dbus_owner,
 		const char *dbus_path,
 		int rfcomm_fd);
+#if ENABLE_MIDI
+struct ba_transport *ba_transport_new_midi(
+		struct ba_device *device,
+		enum ba_transport_profile profile,
+		const char *dbus_owner,
+		const char *dbus_path);
+#endif
+
+#if DEBUG
+const char *ba_transport_debug_name(
+		const struct ba_transport *t);
+#endif
 
 struct ba_transport *ba_transport_lookup(
-		struct ba_device *device,
+		const struct ba_device *device,
 		const char *dbus_path);
 struct ba_transport *ba_transport_ref(
 		struct ba_transport *t);
@@ -345,25 +252,23 @@ struct ba_transport *ba_transport_ref(
 void ba_transport_destroy(struct ba_transport *t);
 void ba_transport_unref(struct ba_transport *t);
 
-struct ba_transport_pcm *ba_transport_pcm_ref(struct ba_transport_pcm *pcm);
-void ba_transport_pcm_unref(struct ba_transport_pcm *pcm);
-
-int ba_transport_pcms_lock(struct ba_transport *t);
-int ba_transport_pcms_unlock(struct ba_transport *t);
-
 int ba_transport_select_codec_a2dp(
 		struct ba_transport *t,
-		const struct a2dp_sep *sep);
+		const struct a2dp_sep_config *remote_sep_cfg,
+		const void *configuration);
 int ba_transport_select_codec_sco(
 		struct ba_transport *t,
-		uint16_t codec_id);
+		uint8_t codec_id);
 
+uint32_t ba_transport_get_codec(
+		const struct ba_transport *t);
 void ba_transport_set_codec(
 		struct ba_transport *t,
-		uint16_t codec_id);
+		uint32_t codec_id);
 
 int ba_transport_start(struct ba_transport *t);
 int ba_transport_stop(struct ba_transport *t);
+int ba_transport_stop_async(struct ba_transport *t);
 int ba_transport_stop_if_no_clients(struct ba_transport *t);
 
 int ba_transport_acquire(struct ba_transport *t);
@@ -372,39 +277,5 @@ int ba_transport_release(struct ba_transport *t);
 int ba_transport_set_a2dp_state(
 		struct ba_transport *t,
 		enum bluez_a2dp_transport_state state);
-
-bool ba_transport_pcm_is_active(
-		struct ba_transport_pcm *pcm);
-
-int ba_transport_pcm_get_delay(
-		const struct ba_transport_pcm *pcm);
-
-unsigned int ba_transport_pcm_volume_level_to_bt(
-		const struct ba_transport_pcm *pcm,
-		int value);
-int ba_transport_pcm_volume_bt_to_level(
-		const struct ba_transport_pcm *pcm,
-		unsigned int value);
-
-int ba_transport_pcm_volume_update(
-		struct ba_transport_pcm *pcm);
-
-int ba_transport_pcm_pause(struct ba_transport_pcm *pcm);
-int ba_transport_pcm_resume(struct ba_transport_pcm *pcm);
-int ba_transport_pcm_drain(struct ba_transport_pcm *pcm);
-int ba_transport_pcm_drop(struct ba_transport_pcm *pcm);
-
-int ba_transport_pcm_release(struct ba_transport_pcm *pcm);
-
-int ba_transport_thread_create(
-		struct ba_transport_thread *th,
-		void *(*routine)(struct ba_transport_thread *),
-		const char *name,
-		bool master);
-
-void ba_transport_thread_cleanup(struct ba_transport_thread *th);
-
-#define debug_transport_thread_loop(th, tag) \
-	debug("IO loop: %s: %s: %s", tag, __func__, ba_transport_type_to_string((th)->t->type))
 
 #endif

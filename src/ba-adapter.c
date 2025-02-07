@@ -1,6 +1,6 @@
 /*
  * BlueALSA - ba-adapter.c
- * Copyright (c) 2016-2019 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -10,17 +10,20 @@
 
 #include "ba-adapter.h"
 
+#if HAVE_CONFIG_H
+# include <config.h>
+#endif
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include <bluetooth/bluetooth.h>
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
 
+#include "ba-config.h"
 #include "ba-device.h"
-#include "bluealsa-config.h"
 #include "hci.h"
 #include "hfp.h"
 #include "utils.h"
@@ -28,14 +31,11 @@
 
 struct ba_adapter *ba_adapter_new(int dev_id) {
 
-	struct ba_adapter *a;
-
 	/* make sure we are within array boundaries */
-	if (dev_id < 0 || dev_id >= HCI_MAX_DEV) {
-		errno = EINVAL;
-		return NULL;
-	}
+	if (dev_id < 0 || dev_id >= HCI_MAX_DEV)
+		return errno = EINVAL, NULL;
 
+	struct ba_adapter *a;
 	if ((a = calloc(1, sizeof(*a))) == NULL)
 		return NULL;
 
@@ -73,7 +73,7 @@ struct ba_adapter *ba_adapter_new(int dev_id) {
 struct ba_adapter *ba_adapter_lookup(int dev_id) {
 
 	if (dev_id < 0 || dev_id >= HCI_MAX_DEV)
-		return NULL;
+		return errno = EINVAL, NULL;
 
 	struct ba_adapter *a;
 
@@ -157,24 +157,45 @@ void ba_adapter_unref(struct ba_adapter *a) {
 	free(a);
 }
 
-int ba_adapter_get_hfp_features_hf(struct ba_adapter *a) {
-	int features = config.hfp.features_rfcomm_hf;
+/**
+ * Get features exposed via RFCOMM for HFP-AG. */
+unsigned int ba_adapter_get_hfp_features_ag(struct ba_adapter *a) {
+	unsigned int features =
+		HFP_AG_FEAT_REJECT |
+		HFP_AG_FEAT_ECS |
+		HFP_AG_FEAT_ECC;
 	if (BA_TEST_ESCO_SUPPORT(a)) {
 #if ENABLE_MSBC
-		features |= HFP_HF_FEAT_CODEC;
+		if (config.hfp.codecs.msbc)
+			features |= HFP_AG_FEAT_CODEC;
 #endif
-		features |= HFP_HF_FEAT_ESCO;
+#if ENABLE_LC3_SWB
+		if (config.hfp.codecs.lc3_swb)
+			features |= HFP_AG_FEAT_CODEC;
+#endif
+		features |= HFP_AG_FEAT_ESCO;
 	}
 	return features;
 }
 
-int ba_adapter_get_hfp_features_ag(struct ba_adapter *a) {
-	int features = config.hfp.features_rfcomm_ag;
+/**
+ * Get features exposed via RFCOMM for HFP-HF. */
+unsigned int ba_adapter_get_hfp_features_hf(struct ba_adapter *a) {
+	unsigned int features =
+		HFP_HF_FEAT_CLI |
+		HFP_HF_FEAT_VOLUME |
+		HFP_HF_FEAT_ECS |
+		HFP_HF_FEAT_ECC;
 	if (BA_TEST_ESCO_SUPPORT(a)) {
 #if ENABLE_MSBC
-		features |= HFP_AG_FEAT_CODEC;
+		if (config.hfp.codecs.msbc)
+			features |= HFP_HF_FEAT_CODEC;
 #endif
-		features |= HFP_AG_FEAT_ESCO;
+#if ENABLE_LC3_SWB
+		if (config.hfp.codecs.lc3_swb)
+			features |= HFP_HF_FEAT_CODEC;
+#endif
+		features |= HFP_HF_FEAT_ESCO;
 	}
 	return features;
 }

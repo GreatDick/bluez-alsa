@@ -15,6 +15,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
+#include <libgen.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -29,12 +30,14 @@
 #include <readline/history.h>
 
 #include "shared/dbus-client.h"
+#include "shared/dbus-client-rfcomm.h"
 #include "shared/log.h"
 
 static int rfcomm_fd = -1;
 static bool main_loop_on = true;
 static bool input_is_tty = true;
 static bool output_is_tty = true;
+static bool properties = false;
 
 static int path2hci(const char *path) {
 	int id;
@@ -52,8 +55,7 @@ static int path2ba(const char *path, bdaddr_t *ba) {
 				&x[5], &x[4], &x[3], &x[2], &x[1], &x[0]) != 6)
 		return -1;
 
-	size_t i;
-	for (i = 0; i < 6; i++)
+	for (size_t i = 0; i < 6; i++)
 		ba->b[i] = x[i];
 
 	return 0;
@@ -69,6 +71,26 @@ static char *strtrim(char *str) {
 		end--;
 	end[1] = '\0';
 	return str;
+}
+
+static bool print_properties(struct ba_dbus_ctx *dbus_ctx, const char* path, DBusError *err) {
+
+	struct ba_rfcomm_props props = { 0 };
+	if (!ba_dbus_rfcomm_props_get(dbus_ctx, path, &props, err)) {
+		ba_dbus_rfcomm_props_free(&props);
+		return false;
+	}
+
+	printf("Transport: %s\n", props.transport);
+	printf("Features:");
+	for (size_t i = 0; i < props.features_len; i++)
+		printf(" %s", props.features[i]);
+	printf("\n");
+	printf("Battery: %d\n", props.battery);
+
+	ba_dbus_rfcomm_props_free(&props);
+
+	return true;
 }
 
 static char *build_rfcomm_command(char *buffer, size_t size, const char *cmd) {
@@ -102,17 +124,18 @@ static void rl_callback_handler(char *line) {
 int main(int argc, char *argv[]) {
 
 	int opt;
-	const char *opts = "hVB:";
+	const char *opts = "hVB:p";
 	const struct option longopts[] = {
 		{ "help", no_argument, NULL, 'h' },
 		{ "version", no_argument, NULL, 'V' },
 		{ "dbus", required_argument, NULL, 'B' },
+		{ "properties", no_argument, NULL, 'p' },
 		{ 0, 0, 0, 0 },
 	};
 
 	char dbus_ba_service[32] = BLUEALSA_SERVICE;
 
-	log_open(argv[0], false);
+	log_open(basename(argv[0]), false);
 
 	while ((opt = getopt_long(argc, argv, opts, longopts, NULL)) != -1)
 		switch (opt) {
@@ -123,7 +146,8 @@ usage:
 					"\nOptions:\n"
 					"  -h, --help\t\tprint this help and exit\n"
 					"  -V, --version\t\tprint version and exit\n"
-					"  -B, --dbus=NAME\tBlueALSA service name suffix\n",
+					"  -B, --dbus=NAME\tBlueALSA service name suffix\n"
+					"  -p, --properties\tprint device properties and exit\n",
 					argv[0]);
 			return EXIT_SUCCESS;
 
@@ -137,6 +161,10 @@ usage:
 				error("Invalid BlueALSA D-Bus service name: %s", dbus_ba_service);
 				return EXIT_FAILURE;
 			}
+			break;
+
+		case 'p' /* --properties */ :
+			properties = true;
 			break;
 
 		default:
@@ -159,7 +187,7 @@ usage:
 	DBusError err = DBUS_ERROR_INIT;
 	struct ba_dbus_ctx dbus_ctx;
 
-	if (!bluealsa_dbus_connection_ctx_init(&dbus_ctx, dbus_ba_service, &err)) {
+	if (!ba_dbus_connection_ctx_init(&dbus_ctx, dbus_ba_service, &err)) {
 		error("Couldn't initialize D-Bus context: %s", err.message);
 		return EXIT_FAILURE;
 	}
@@ -167,7 +195,15 @@ usage:
 	char rfcomm_path[128];
 	sprintf(rfcomm_path, "/org/bluealsa/hci%d/dev_%.2X_%.2X_%.2X_%.2X_%.2X_%.2X/rfcomm",
 			hci_dev_id, addr.b[5], addr.b[4], addr.b[3], addr.b[2], addr.b[1], addr.b[0]);
-	if (!bluealsa_dbus_open_rfcomm(&dbus_ctx, rfcomm_path, &rfcomm_fd, &err)) {
+
+	if (properties) {
+		if (print_properties(&dbus_ctx, rfcomm_path, &err))
+			return EXIT_SUCCESS;
+		error("D-Bus error: %s", err.message);
+		return EXIT_FAILURE;
+	}
+
+	if (!ba_dbus_rfcomm_open(&dbus_ctx, rfcomm_path, &rfcomm_fd, &err)) {
 		error("Couldn't open RFCOMM: %s", err.message);
 		return EXIT_FAILURE;
 	}

@@ -1,6 +1,6 @@
 /*
  * BlueALSA - log.c
- * Copyright (c) 2016-2022 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -10,12 +10,17 @@
 
 #include "shared/log.h"
 
+#if HAVE_CONFIG_H
+# include <config.h>
+#endif
+
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
@@ -34,6 +39,8 @@
 static char *_ident = NULL;
 /* if true, system logging is enabled */
 static bool _syslog = false;
+/* minimum priority to be logged */
+static int _priority_limit = LOG_DEBUG;
 
 #if DEBUG_TIME
 
@@ -49,26 +56,30 @@ static void init_ts0(void) {
 
 void log_open(const char *ident, bool syslog) {
 
-	free(_ident);
-	_ident = strdup(ident);
+	if (ident != NULL)
+		_ident = strdup(ident);
 
 	if ((_syslog = syslog) == true)
 		openlog(ident, 0, LOG_USER);
 
 }
 
-static void vlog(int priority, const char *format, va_list ap) {
+void log_set_min_priority(int priority) {
+	_priority_limit = priority;
+}
 
-	static const char *priority2str[] = {
-		[LOG_EMERG] = "X",
-		[LOG_ALERT] = "A",
-		[LOG_CRIT] = "C",
-		[LOG_ERR] = "E",
-		[LOG_WARNING] = "W",
-		[LOG_NOTICE] = "N",
-		[LOG_INFO] = "I",
-		[LOG_DEBUG] = "D",
-	};
+static const char *priority2str[] = {
+	[LOG_EMERG] = "X",
+	[LOG_ALERT] = "A",
+	[LOG_CRIT] = "C",
+	[LOG_ERR] = "E",
+	[LOG_WARNING] = "W",
+	[LOG_NOTICE] = "N",
+	[LOG_INFO] = "I",
+	[LOG_DEBUG] = "D",
+};
+
+static void vlog(int priority, const char *format, va_list ap) {
 
 	int oldstate;
 
@@ -78,43 +89,50 @@ static void vlog(int priority, const char *format, va_list ap) {
 	 * has to be temporally disabled. */
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldstate);
 
-#if DEBUG_TIME
-	struct timespec ts;
-	gettimestamp(&ts);
-	timespecsub(&ts, &_ts0, &ts);
-#endif
-
 	if (_syslog) {
+
 		va_list ap_syslog;
 		va_copy(ap_syslog, ap);
 		vsyslog(priority, format, ap_syslog);
 		va_end(ap_syslog);
+
 	}
-
-	flockfile(stderr);
-
-	if (_ident != NULL)
-		fprintf(stderr, "%s: ", _ident);
+	else {
 
 #if DEBUG_TIME
-	fprintf(stderr, "%lu.%.9lu: ", (long int)ts.tv_sec, ts.tv_nsec);
+		struct timespec ts;
+		gettimestamp(&ts);
+		timespecsub(&ts, &_ts0, &ts);
 #endif
 
-#if DEBUG
-	fprintf(stderr, "[%d] ", gettid());
+		flockfile(stderr);
+
+		if (_ident != NULL)
+			fprintf(stderr, "%s: ", _ident);
+
+#if DEBUG_TIME
+		fprintf(stderr, "%lu.%.6lu: ", (long int)ts.tv_sec, ts.tv_nsec / 1000);
 #endif
 
-	fprintf(stderr, "%s: ", priority2str[priority]);
-	vfprintf(stderr, format, ap);
-	fputs("\n", stderr);
+#if DEBUG && HAVE_GETTID
+		fprintf(stderr, "[%d] ", gettid());
+#endif
 
-	funlockfile(stderr);
+		fprintf(stderr, "%s: ", priority2str[priority]);
+		vfprintf(stderr, format, ap);
+		fputs("\n", stderr);
+
+		funlockfile(stderr);
+
+	}
 
 	pthread_setcancelstate(oldstate, NULL);
 
 }
 
 void log_message(int priority, const char *format, ...) {
+	if (priority > _priority_limit)
+		return;
 	va_list ap;
 	va_start(ap, format);
 	vlog(priority, format, ap);
@@ -154,8 +172,7 @@ void callstackdump_(const char *label) {
 	size_t n = backtrace(frames, ARRAYSIZE(frames));
 	char **symbols = backtrace_symbols(frames, n);
 
-	size_t i;
-	for (i = 1; i < n; i++)
+	for (size_t i = 1; i < n; i++)
 		ptr += snprintf(ptr, sizeof(buffer) + buffer - ptr, "%s%s",
 				symbols[i], (i + 1 < n) ? " < " : "");
 
@@ -174,20 +191,18 @@ void callstackdump_(const char *label) {
  *
  * @param label Label printed before the memory block output.
  * @param data Address of the memory block.
- * @param len Number of bytes which should be printed.
- * @param compact Dump memory block without spaces. */
-void hexdump_(const char *label, const void *data, size_t len, bool compact) {
+ * @param len Number of bytes which should be printed. */
+void hexdump_(const char *label, const void *data, size_t len) {
 
-	const char *sep = "";
-	const char *spacing = compact ? "" : " ";
 	char *buf = malloc(len * 3 + 1);
 	char *p = buf;
 
-	for (size_t i = 0; i < len; sep = ++i % 4 ? "" : spacing) {
-		p += sprintf(p, "%s%02x", sep, *(unsigned char *)data & 0xFF);
+	for (size_t i = 0; i < len; i++) {
+		p += sprintf(p, "%02x", *(unsigned char *)data & 0xFF);
 		data = ((unsigned char *)data) + 1;
 	}
 
+	*p = '\0';
 	log_message(LOG_DEBUG, "%s [len=%zu]: %s", label, len, buf);
 	free(buf);
 }

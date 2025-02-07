@@ -5,13 +5,13 @@ bluealsa-plugins
 Bluetooth Audio ALSA Plugins
 ----------------------------
 
-:Date: August 2022
+:Date: August 2024
 :Manual section: 7
 :Manual group: Miscellaneous
 :Version: $VERSION$
 
-SYNOPSIS
-========
+DESCRIPTION
+===========
 
 BlueALSA permits applications to access Bluetooth audio devices using the ALSA
 alsa-lib API. Users of those applications can then use Bluetooth speakers,
@@ -22,7 +22,7 @@ one for CTL volume controls.
 PCM PLUGIN
 ==========
 
-The BlueALSA ALSA PCM plugin communicates with the ``bluealsa(8)`` service.
+The BlueALSA ALSA PCM plugin communicates with the ``bluealsad(8)`` service.
 It can be used to define ALSA PCMs in your own configuration file (e.g.
 ~/.asoundrc), or you can use the predefined **bluealsa** PCM.
 
@@ -63,14 +63,26 @@ PCM Parameters
     **APTX** are all accepted. If the specified codec is not available the
     plugin issues a warning and uses the default value instead.
 
+    BlueALSA does not support changing the HFP codec from a HFP-HF node, only
+    the HFP-AG node can change the HFP codec.
+
+    oFono does not permit the audio agent to select the codec, so this
+    parameter has no effect when BlueALSA is used with oFono for HFP support.
+
     For the A2DP profile it is possible to also specify a "configuration" for
     the codec by appending the configuration as a hex string separated from the
-    codec name by a colon. For example:
+    codec name by a colon. The bits responsible for the number of channels and
+    the sample rate are set by the plugin with the respect to options
+    provided by the user (channel mode and sample rate bits act as a
+    mask). For example:
 
     ::
 
-      CODEC=aptx:4f0000000100ff
+      CODEC=SBC:FC450240
 
+    This SBC configuration limits the channel mode options to mono and dual
+    channel. So, in case of 2 channel audio stream, the plugin will negotiate
+    the dual channel mode instead of default (if supported) joint stereo mode.
 
   VOL
     Specifies the initial volume for the PCM when opened. The default value is
@@ -87,19 +99,21 @@ PCM Parameters
 
   SOFTVOL
     Enables or disables BlueALSA's software volume feature for this PCM. See
-    the ``bluealsa(8)`` manual page for more information on software volume.
+    the ``bluealsad(8)`` manual page for more information on software volume.
     This is a boolean option (values **on** or **off**), but also accepts the
     special value **unchanged** which causes the PCM to use its existing
     softvol value. The default value is **unchanged**.
 
   DELAY
-    An integer number which is added to the reported latency value in order to
-    manually adjust the audio synchronization. It is not normally required and
-    defaults to **0**.
+    An integer number which is added to the reported delay (latency) value in
+    order to manually adjust the audio synchronization. It is not normally
+    required and defaults to **0**. See the **EXT** parameter of the CTL plugin
+    in the `CTL Parameters`_ section below for a more flexible and convenient
+    method of manually adjusting the reported delay by using a mixer control.
 
   SRV
     The D-Bus service name of the BlueALSA daemon. Defaults to
-    **org.bluealsa**. See ``bluealsa(8)`` for more information. Not normally
+    **org.bluealsa**. See ``bluealsad(8)`` for more information. Not normally
     required.
 
 Setting Different Defaults
@@ -117,6 +131,9 @@ own configuration (e.g. in ~/.asoundrc.conf) for example:
   defaults.bluealsa.softvol off
   defaults.bluealsa.delay 5000
   defaults.bluealsa.service "org.bluealsa.source"
+
+Note that **volume** takes a string value and so the default must be enclosed
+in quotation marks.
 
 Positional Parameters
 ~~~~~~~~~~~~~~~~~~~~~
@@ -220,8 +237,8 @@ Now using ``aplay -L`` will include the following in its output:
       My Bluetooth headphones
   #
 
-If you are using the predefined bluealsa PCM, then you can create a "namehint"
-entry in your ~/.asoundrc file like this:
+If you are using the predefined **bluealsa** PCM, then you can create a
+"namehint" entry in your ~/.asoundrc file like this:
 
 ::
 
@@ -397,7 +414,7 @@ connected.
 The Predefined **bluealsa** CTL
 -------------------------------
 
-The **bluealsa** CTL has parameters DEV, EXT, BAT, BTT, DYN, and SRV. All the
+The **bluealsa** CTL has parameters DEV, EXT, BTT, DYN, and SRV. All the
 parameters have defaults.
 
 CTL Parameters
@@ -411,18 +428,45 @@ CTL Parameters
     selects the most recently connected device.
 
   EXT
-    Causes the plugin to include controls for codec and software volume
-    selection. If the value is **yes** then these additional controls are
-    included. The default is **no**. The soft volume controls are called "Mode"
-    and take values "software" and "pass-through"; the playback control has
-    index 0 and capture control index 1. See ``bluealsa(8)`` for more on the
-    soft volume setting , and `CODEC SELECTION`_ below for more information on
-    the Codec control.
+    Causes the plugin to include extra controls. These are the controls for
+    Bluetooth codec selection, volume mode selection, client delay (sync)
+    and/or battery level indicator.
+    If the value is **yes** then all of these additional controls are included;
+    if the value is **no** then none of them are included. The default is
+    **no**.
 
-  BAT
-    Causes the plugin to include a (read-only) battery level indicator,
-    provided the device supports this. If the value is **yes** then the battery
-    indicator is enabled, any other value disables it. The default is **no**.
+    This parameter can also select individual controls by using a colon (':')
+    separated list of control names. The control names are **codec**, **mode**,
+    **sync** and **battery**. For example:
+
+    ::
+
+        EXT=codec
+        EXT=mode:battery
+
+    See `Codec switching`_ in the **NOTES** section below for more information
+    on the codec selection control.
+
+    The volume mode controls take values "software" and "pass-through"; the
+    playback control has index 0 and capture control has index 1.
+    See the `Volume control` section in the ``bluealsad(8)`` for more
+    information on the software volume setting.
+
+    The client delay controls are called "Sync". They can be used to apply
+    a fixed adjustment to the delay reported by the associated PCM to the
+    application, and may be useful with applications that need to synchronize
+    the bluetooth audio stream with some some other stream, such as a video.
+    The values are in milliseconds from ``-3275 ms`` to ``+3275 ms`` in steps
+    of ``25 ms``. The playback control has index 0 and the capture control has
+    index 1. Each codec supported by a PCM has its own client delay value.
+    Note that this control changes only the delay value reported to the
+    application by ALSA, it does not affect the actual delay (latency) of the
+    PCM stream. Values set by this control type are saved in the BlueALSA
+    persistent state files, and so are remembered and automatically applied
+    each time the PCM is used.
+
+    The read-only battery level indicator will be shown only if the device
+    supports battery level reporting.
 
   BTT
     Appends Bluetooth transport type (e.g. "-SNK" or "-HFP-AG") to the control
@@ -443,7 +487,7 @@ CTL Parameters
     the default value is "**yes**". This argument is ignored in default mode;
     in that mode operation is always dynamic. There are some applications that
     are not programmed to handle dynamic addition or removal of controls, and
-    can fail when such events occur. Setting this argument to "no" in single
+    can fail when such events occur. Setting this argument to **no** in single
     device mode with such applications can protect them from such failures.
     When dynamic operation is disabled, the plugin never adds or removes any
     controls. If a single profile is disconnected, then its associated volume
@@ -452,14 +496,16 @@ CTL Parameters
 
   SRV
     The D-Bus service name of the BlueALSA daemon. Defaults to
-    **org.bluealsa**. See ``bluealsa(8)`` for more information.
+    **org.bluealsa**. See ``bluealsad(8)`` for more information.
 
 The default values can be overridden in the ALSA configuration, for example:
 
 ::
 
   defaults.bluealsa.ctl.device "00:11:22:33:44:55"
-  defaults.bluealsa.ctl.battery "no"
+  defaults.bluealsa.ctl.bttransport "no"
+  defaults.bluealsa.ctl.dynamic "yes"
+  defaults.bluealsa.ctl.extended "no"
 
 Defining BlueALSA CTLs
 ----------------------
@@ -473,8 +519,7 @@ configuration node has the following fields:
   ctl.name {
     type bluealsa     # Bluetooth PCM
     [device STR]      # Device address (default "FF:FF:FF:FF:FF:FF")
-    [extended STR]    # Include additional controls (yes/no, default no)
-    [battery STR]     # Include battery level indicator (yes/no, default no)
+    [extended STR]    # Include additional controls (default no)
     [bttransport STR] # Append BT transport to element names (yes/no, default no)
     [dynamic STR]     # Enable dynamic operation (yes/no, default yes)
     [service STR]     # D-Bus name of service (default "org.bluealsa")
@@ -485,16 +530,19 @@ section above for more information on each field. As for PCM definitions above,
 the default values for the optional fields are hard-coded into the plugin; they
 are not overridden by the configuration ``defaults.bluealsa.`` settings.
 
-FILES
+NOTES
 =====
 
-/etc/alsa/conf.d/20-bluealsa.conf
-    BlueALSA device configuration file.
-    ALSA additional configuration, defines the ``bluealsa`` PCM and CTL
-    devices.
+Codec selection
+---------------
 
-CODEC SELECTION
-===============
+When used on a HFP gateway node, there may be a brief delay with HFP PCMs
+after connection until the codec is selected. This delay is typically less
+than two seconds. During this time interval it is not possible to open the
+PCM plugin, it will fail with "Resource temporarily unavailable" (EAGAIN).
+
+Codec switching
+---------------
 
 Changing the codec used by a BlueALSA transport causes the PCM(s) running on
 that transport to terminate. Therefore using a Codec control can have
@@ -505,21 +553,67 @@ a different codec is displayed. This is not ideal, so the use of this control
 type with ``alsamixer(1)`` is not recommended. The control type does however
 work well with other mixer applications such as ``amixer(1)``.
 
+Note that BlueALSA does not support changing the HFP codec from a HFP-HF node,
+only the HFP-AG node can change the HFP codec.
+
+Transport acquisition
+---------------------
+
+The audio connection of a profile is not established immediately that a device
+connects. The A2DP source device, or HFP/HSP gateway device, must first
+"acquire" the profile transport.
+
+When the BlueALSA PCM plugin is used on a source A2DP or gateway HFP/HSP node,
+then **bluealsad(8)** will automatically acquire the transport and begin audio
+transfer when the plugin starts the PCM.
+
+When used on an A2DP sink or HFP/HSP HF/HS node then **bluealsad(8)** must wait
+for the remote device to acquire the transport. During this waiting time the
+PCM plugin behaves as if the device "clock" is stopped, it does not generate
+any poll() events, and the application will be blocked when writing or reading
+to/from the PCM. For applications playing audio from a file or recording audio
+to a file this is not normally an issue; but when streaming between some other
+device and a BlueALSA device this may lead to very large latency (delay) or
+trigger underruns or overruns in the other device.
+
+PCM drain and non-blocking operation
+------------------------------------
+
+The BlueALSA PCM plugin does not support draining of capture PCMs. For a
+capture PCM `snd_pcm_drain()` has the same effect as `snd_pcm_drop()`. This is
+a limitation of the ALSA `ioplug` external plugin API.
+
+For playback PCMs, BlueALSA has support for the drain operation in both
+blocking and non-blocking modes. In blocking mode the drain operation will wait
+until the BlueALSA server has played out the final audio frame. In non-blocking
+mode the plugin will inform the application of drain completion as soon as the
+ALSA ring buffer has been flushed; this means that some audio frames at the end
+of the stream may be lost in non-blocking mode as the PCM may stop before the
+server has had time to encode and play out all the frames.
+
+FILES
+=====
+
+/etc/alsa/conf.d/20-bluealsa.conf
+    BlueALSA device configuration file.
+    ALSA additional configuration, defines the ``bluealsa`` PCM and CTL
+    devices.
+
 COPYRIGHT
 =========
 
-Copyright (c) 2016-2022 Arkadiusz Bokowy.
+Copyright (c) 2016-2024 Arkadiusz Bokowy.
 
 The bluez-alsa project is licensed under the terms of the MIT license.
 
 SEE ALSO
 ========
 
-``alsamixer(1)``, ``amixer(1)``, ``aplay(1)``, ``bluealsa(8)``,
-``bluetoothctl(1)``, ``bluetoothd(8)``
+``alsamixer(1)``, ``amixer(1)``, ``aplay(1)``, ``bluetoothctl(1)``,
+``bluealsad(8)``, ``bluetoothd(8)``
 
 Project web site
-  https://github.com/Arkq/bluez-alsa
+  https://github.com/arkq/bluez-alsa
 
 ALSA configuration file syntax
   https://www.alsa-project.org/alsa-doc/alsa-lib/conf.html

@@ -1,6 +1,6 @@
 /*
  * BlueALSA - storage.c
- * Copyright (c) 2016-2022 Arkadiusz Bokowy
+ * Copyright (c) 2016-2024 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -11,23 +11,29 @@
 #include "storage.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 
 #include <bluetooth/bluetooth.h>
 
 #include <glib.h>
 
+#include "ba-transport.h"
+#include "hfp.h"
 #include "utils.h"
+#include "shared/a2dp-codecs.h"
+#include "shared/defs.h"
 #include "shared/log.h"
 
-#define BA_STORAGE_KEY_SOFT_VOLUME "SoftVolume"
-#define BA_STORAGE_KEY_VOLUME      "Volume"
-#define BA_STORAGE_KEY_MUTE        "Mute"
+#define BA_STORAGE_KEY_CLIENT_DELAYS    "ClientDelays"
+#define BA_STORAGE_KEY_SOFT_VOLUME      "SoftVolume"
+#define BA_STORAGE_KEY_VOLUME           "Volume"
+#define BA_STORAGE_KEY_MUTE             "Mute"
 
 struct storage {
 	/* remote BT device address */
@@ -37,6 +43,7 @@ struct storage {
 };
 
 static char storage_root_dir[128];
+static pthread_mutex_t storage_mutex = PTHREAD_MUTEX_INITIALIZER;
 static GHashTable *storage_map = NULL;
 
 static struct storage *storage_lookup(const bdaddr_t *addr) {
@@ -48,10 +55,10 @@ static struct storage *storage_new(const bdaddr_t *addr) {
 	struct storage *st;
 	/* return existing storage if it exists */
 	if ((st = storage_lookup(addr)) != NULL)
-		return st;
+		goto final;
 
 	if ((st = malloc(sizeof(*st))) == NULL)
-		return NULL;
+		goto final;
 
 	bacpy(&st->addr, addr);
 	st->keyfile = g_key_file_new();
@@ -62,6 +69,7 @@ static struct storage *storage_new(const bdaddr_t *addr) {
 	 * pointer might/will be used to access the new value! */
 	g_hash_table_insert(storage_map, &st->addr, st);
 
+final:
 	return st;
 }
 
@@ -79,6 +87,7 @@ static void storage_free(struct storage *st) {
  * @return On success this function returns 0. Otherwise -1 is returned. */
 int storage_init(const char *root) {
 
+	debug("Initializing persistent storage: %s", root);
 	strncpy(storage_root_dir, root, sizeof(storage_root_dir) - 1);
 	if (mkdir(storage_root_dir, S_IRWXU) == -1 && errno != EEXIST)
 		warn("Couldn't create storage directory: %s", strerror(errno));
@@ -91,6 +100,15 @@ int storage_init(const char *root) {
 }
 
 /**
+ * Cleanup resources allocated by the persistent storage. */
+void storage_destroy(void) {
+	if (storage_map == NULL)
+		return;
+	g_hash_table_unref(storage_map);
+	storage_map = NULL;
+}
+
+/**
  * Load persistent storage file for the given BT device. */
 int storage_device_load(const struct ba_device *d) {
 
@@ -98,22 +116,29 @@ int storage_device_load(const struct ba_device *d) {
 	char path[sizeof(storage_root_dir) + sizeof(addrstr)];
 	ba2str(&d->addr, addrstr);
 	snprintf(path, sizeof(path), "%s/%s", storage_root_dir, addrstr);
+	int rv = -1;
+
+	pthread_mutex_lock(&storage_mutex);
 
 	debug("Loading storage: %s", path);
 
 	struct storage *st;
 	if ((st = storage_new(&d->addr)) == NULL)
-		return -1;
+		goto final;
 
 	GError *err = NULL;
 	if (!g_key_file_load_from_file(st->keyfile, path, G_KEY_FILE_NONE, &err)) {
 		if (err->code != G_FILE_ERROR_NOENT)
 			warn("Couldn't load storage: %s", err->message);
 		g_error_free(err);
-		return -1;
+		goto final;
 	}
 
-	return 0;
+	rv = 0;
+
+final:
+	pthread_mutex_unlock(&storage_mutex);
+	return rv;
 }
 
 /**
@@ -124,10 +149,13 @@ int storage_device_save(const struct ba_device *d) {
 	char path[sizeof(storage_root_dir) + sizeof(addrstr)];
 	ba2str(&d->addr, addrstr);
 	snprintf(path, sizeof(path), "%s/%s", storage_root_dir, addrstr);
+	int rv = -1;
+
+	pthread_mutex_lock(&storage_mutex);
 
 	struct storage *st;
 	if ((st = storage_lookup(&d->addr)) == NULL)
-		return -1;
+		goto final;
 
 	debug("Saving storage: %s", path);
 
@@ -135,13 +163,138 @@ int storage_device_save(const struct ba_device *d) {
 	if (!g_key_file_save_to_file(st->keyfile, path, &err)) {
 		error("Couldn't save storage: %s", err->message);
 		g_error_free(err);
-		return -1;
+		goto final;
 	}
 
 	/* remove the storage from the map */
 	g_hash_table_remove(storage_map, &d->addr);
 
-	return 0;
+	rv = 0;
+
+final:
+	pthread_mutex_unlock(&storage_mutex);
+	return rv;
+}
+
+/**
+ * Clear persistent storage for the given BT device. */
+int storage_device_clear(const struct ba_device *d) {
+
+	int rv = -1;
+
+	pthread_mutex_lock(&storage_mutex);
+
+	struct storage *st;
+	if ((st = storage_lookup(&d->addr)) == NULL)
+		goto final;
+
+	g_key_file_free(st->keyfile);
+	st->keyfile = g_key_file_new();
+
+	rv = 0;
+
+final:
+	pthread_mutex_unlock(&storage_mutex);
+	return rv;
+}
+
+/**
+ * Load PCM client delays to the hash table. */
+static GHashTable *storage_pcm_data_load_delays(GKeyFile *db, const char *group,
+		const struct ba_transport_pcm *pcm) {
+
+	const struct ba_transport *t = pcm->t;
+	GHashTable *delays = g_hash_table_new(NULL, NULL);
+
+	size_t length = 0;
+	char **list = g_key_file_get_string_list(db, group,
+			BA_STORAGE_KEY_CLIENT_DELAYS, &length, NULL);
+
+	for (size_t i = 0; i < length; i++) {
+		char *codec_name = list[i];
+		char *value = strchr(list[i], ':');
+		if (value == NULL)
+			continue;
+		/* Split string into a codec name and delay value. */
+		*value++ = '\0';
+		uint32_t codec_id = 0xFFFFFFFF;
+		if (t->profile & BA_TRANSPORT_PROFILE_MASK_A2DP &&
+				(codec_id = a2dp_codecs_codec_id_from_string(codec_name)) == 0xFFFFFFFF)
+			continue;
+		if (t->profile & BA_TRANSPORT_PROFILE_MASK_SCO &&
+				(codec_id = hfp_codec_id_from_string(codec_name)) == HFP_CODEC_UNDEFINED)
+			continue;
+		const int16_t delay = atoi(value);
+		g_hash_table_insert(delays, GINT_TO_POINTER(codec_id), GINT_TO_POINTER(delay));
+	}
+
+	g_strfreev(list);
+	return delays;
+}
+
+static int storage_pcm_data_sync_delay(GKeyFile *db, const char *group,
+		struct ba_transport_pcm *pcm) {
+
+	const struct ba_transport *t = pcm->t;
+	int rv = 0;
+
+	GHashTable *delays = storage_pcm_data_load_delays(db, group, pcm);
+
+	void *value = NULL;
+	const uint32_t codec_id = t->codec_id;
+	if (g_hash_table_lookup_extended(delays, GINT_TO_POINTER(codec_id), NULL, &value)) {
+		/* If the right codec was found, sync the client delay. */
+		pcm->client_delay_dms = GPOINTER_TO_INT(value);
+		rv = 1;
+	}
+
+	g_hash_table_unref(delays);
+	return rv;
+}
+
+static int storage_pcm_data_sync_volume(GKeyFile *db, const char *group,
+		struct ba_transport_pcm *pcm) {
+
+	const size_t channels = pcm->channels;
+	int *list_volume;
+	gboolean *list_mute;
+	gsize len;
+	int rv = 0;
+
+	if (g_key_file_has_key(db, group, BA_STORAGE_KEY_SOFT_VOLUME, NULL)) {
+		pcm->soft_volume = g_key_file_get_boolean(db, group,
+				BA_STORAGE_KEY_SOFT_VOLUME, NULL);
+		rv = 1;
+	}
+
+	if ((list_volume = g_key_file_get_integer_list(db, group,
+					BA_STORAGE_KEY_VOLUME, &len, NULL)) != NULL &&
+			len <= ARRAYSIZE(pcm->volume)) {
+		for (size_t i = 0; i < len; i++)
+			ba_transport_pcm_volume_set(&pcm->volume[i], &list_volume[i], NULL, NULL);
+		/* Upscale volume for the rest of the channels if needed. */
+		for (size_t i = len; i < channels; i++)
+			ba_transport_pcm_volume_set(&pcm->volume[i], &list_volume[0], NULL, NULL);
+		rv = 1;
+	}
+
+	if ((list_mute = g_key_file_get_boolean_list(db, group,
+					BA_STORAGE_KEY_MUTE, &len, NULL)) != NULL &&
+			len <= ARRAYSIZE(pcm->volume)) {
+		for (size_t i = 0; i < len; i++) {
+			const bool mute = list_mute[i];
+			ba_transport_pcm_volume_set(&pcm->volume[i], NULL, &mute, NULL);
+		}
+		const bool mute = list_mute[0];
+		/* Upscale mute for the rest of the channels if needed. */
+		for (size_t i = len; i < channels; i++)
+			ba_transport_pcm_volume_set(&pcm->volume[i], NULL, &mute, NULL);
+		rv = 1;
+	}
+
+	g_free(list_volume);
+	g_free(list_mute);
+	return rv;
 }
 
 /**
@@ -156,6 +309,8 @@ int storage_pcm_data_sync(struct ba_transport_pcm *pcm) {
 	const struct ba_device *d = t->d;
 	int rv = 0;
 
+	pthread_mutex_lock(&storage_mutex);
+
 	struct storage *st;
 	if ((st = storage_lookup(&d->addr)) == NULL)
 		goto final;
@@ -166,41 +321,76 @@ int storage_pcm_data_sync(struct ba_transport_pcm *pcm) {
 	if (!g_key_file_has_group(keyfile, group))
 		goto final;
 
-	if (g_key_file_has_key(keyfile, group, BA_STORAGE_KEY_SOFT_VOLUME, NULL)) {
-		pcm->soft_volume = g_key_file_get_boolean(keyfile, group,
-				BA_STORAGE_KEY_SOFT_VOLUME, NULL);
+	if (storage_pcm_data_sync_delay(keyfile, group, pcm))
 		rv = 1;
-	}
-
-	if (g_key_file_has_key(keyfile, group, BA_STORAGE_KEY_VOLUME, NULL)) {
-		int *list;
-		gsize len = 0;
-		if ((list = g_key_file_get_integer_list(keyfile, group,
-						BA_STORAGE_KEY_VOLUME, &len, NULL)) != NULL &&
-				len == 2) {
-			ba_transport_pcm_volume_set(&pcm->volume[0], &list[0], NULL, NULL);
-			ba_transport_pcm_volume_set(&pcm->volume[1], &list[1], NULL, NULL);
-		}
-		g_free(list);
+	if (storage_pcm_data_sync_volume(keyfile, group, pcm))
 		rv = 1;
-	}
-
-	if (g_key_file_has_key(keyfile, group, BA_STORAGE_KEY_MUTE, NULL)) {
-		gboolean *list;
-		gsize len = 0;
-		if ((list = g_key_file_get_boolean_list(keyfile, group,
-						BA_STORAGE_KEY_MUTE, &len, NULL)) != NULL &&
-				len == 2) {
-			const bool mute[2] = { list[0], list[1] };
-			ba_transport_pcm_volume_set(&pcm->volume[0], NULL, &mute[0], NULL);
-			ba_transport_pcm_volume_set(&pcm->volume[1], NULL, &mute[1], NULL);
-		}
-		g_free(list);
-		rv = 1;
-	}
 
 final:
+	pthread_mutex_unlock(&storage_mutex);
 	return rv;
+}
+
+static void storage_pcm_data_update_delay(GKeyFile *db, const char *group,
+		const struct ba_transport_pcm *pcm) {
+
+	const struct ba_transport *t = pcm->t;
+
+	GHashTable *delays = storage_pcm_data_load_delays(db, group, pcm);
+	/* Update the delay value for the current codec. */
+	g_hash_table_insert(delays, GINT_TO_POINTER(t->codec_id),
+			GINT_TO_POINTER(pcm->client_delay_dms));
+
+	const size_t num_codecs = g_hash_table_size(delays);
+	char **list = calloc(num_codecs + 1, sizeof(char *));
+
+	GHashTableIter iter;
+	g_hash_table_iter_init(&iter, delays);
+
+	size_t index = 0;
+	void *key, *value;
+	while (g_hash_table_iter_next(&iter, &key, &value)) {
+		if (GPOINTER_TO_INT(value) == 0)
+			/* Do not store the delay if it is zero. */
+			continue;
+		const char *codec = NULL;
+		if (t->profile & BA_TRANSPORT_PROFILE_MASK_A2DP)
+			codec = a2dp_codecs_codec_id_to_string(GPOINTER_TO_INT(key));
+		if (t->profile & BA_TRANSPORT_PROFILE_MASK_SCO)
+			codec = hfp_codec_id_to_string(GPOINTER_TO_INT(key));
+		if (codec == NULL)
+			continue;
+		list[index] = malloc(strlen(codec) + 1 + 6 + 1);
+		sprintf(list[index], "%s:%d", codec, GPOINTER_TO_INT(value));
+		index++;
+	}
+
+	g_key_file_set_string_list(db, group, BA_STORAGE_KEY_CLIENT_DELAYS,
+		(const char * const *)list, num_codecs);
+
+	g_hash_table_unref(delays);
+	for (size_t i = 0; i < num_codecs; i++)
+		free(list[i]);
+	free(list);
+
+}
+
+static void storage_pcm_data_update_volume(GKeyFile *db, const char *group,
+		const struct ba_transport_pcm *pcm) {
+
+	const size_t channels = pcm->channels;
+	gboolean mute[ARRAYSIZE(pcm->volume)];
+	int volume[ARRAYSIZE(pcm->volume)];
+
+	for (size_t i = 0; i < channels; i++) {
+		mute[i] = pcm->volume[i].soft_mute;
+		volume[i] = pcm->volume[i].level;
+	}
+
+	g_key_file_set_boolean(db, group, BA_STORAGE_KEY_SOFT_VOLUME, pcm->soft_volume);
+	g_key_file_set_integer_list(db, group, BA_STORAGE_KEY_VOLUME, volume, channels);
+	g_key_file_set_boolean_list(db, group, BA_STORAGE_KEY_MUTE, mute, channels);
+
 }
 
 /**
@@ -212,23 +402,24 @@ int storage_pcm_data_update(const struct ba_transport_pcm *pcm) {
 
 	const struct ba_transport *t = pcm->t;
 	const struct ba_device *d = t->d;
+	int rv = -1;
+
+	pthread_mutex_lock(&storage_mutex);
 
 	struct storage *st;
 	if ((st = storage_lookup(&d->addr)) == NULL)
 		if ((st = storage_new(&d->addr)) == NULL)
-			return -1;
+			goto final;
 
 	GKeyFile *keyfile = st->keyfile;
 	const char *group = pcm->ba_dbus_path;
 
-	g_key_file_set_boolean(keyfile, group, BA_STORAGE_KEY_SOFT_VOLUME,
-			pcm->soft_volume);
+	storage_pcm_data_update_delay(keyfile, group, pcm);
+	storage_pcm_data_update_volume(keyfile, group, pcm);
 
-	int volume[2] = { pcm->volume[0].level, pcm->volume[1].level };
-	g_key_file_set_integer_list(keyfile, group, BA_STORAGE_KEY_VOLUME, volume, 2);
+	rv = 0;
 
-	gboolean mute[2] = { pcm->volume[0].soft_mute, pcm->volume[1].soft_mute };
-	g_key_file_set_boolean_list(keyfile, group, BA_STORAGE_KEY_MUTE, mute, 2);
-
-	return 0;
+final:
+	pthread_mutex_unlock(&storage_mutex);
+	return rv;
 }

@@ -1,6 +1,6 @@
 /*
  * BlueALSA - aplay.c
- * Copyright (c) 2016-2022 Arkadiusz Bokowy
+ * Copyright (c) 2016-2025 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -15,14 +15,21 @@
 #include <assert.h>
 #include <errno.h>
 #include <getopt.h>
+#include <libgen.h>
 #include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <sys/param.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <alsa/asoundlib.h>
@@ -30,14 +37,33 @@
 #include <dbus/dbus.h>
 
 #include "shared/dbus-client.h"
+#include "shared/dbus-client-pcm.h"
 #include "shared/defs.h"
 #include "shared/ffb.h"
 #include "shared/log.h"
+#include "shared/nv.h"
+#include "shared/rt.h"
 #include "alsa-mixer.h"
 #include "alsa-pcm.h"
 #include "dbus.h"
+#include "delay-report.h"
 
-struct pcm_worker {
+/* Many devices cannot synchronize A/V with very high audio latency. To keep
+ * the overall latency below 400ms we choose default ALSA parameters such that
+ * the ALSA latency for A2DP is below 200ms. For SCO we choose to prioritize
+ * much lower latency over audio quality. */
+#define DEFAULT_PERIOD_TIME_A2DP 50000
+#define DEFAULT_PERIOD_TIME_SCO 20000
+#define DEFAULT_PERIODS 4
+
+enum volume_type {
+	VOL_TYPE_AUTO,
+	VOL_TYPE_MIXER,
+	VOL_TYPE_SOFTWARE,
+	VOL_TYPE_NONE,
+};
+
+struct io_worker {
 	pthread_t thread;
 	/* used BlueALSA PCM device */
 	struct ba_pcm ba_pcm;
@@ -46,13 +72,11 @@ struct pcm_worker {
 	/* file descriptor of PCM control */
 	int ba_pcm_ctrl_fd;
 	/* opened playback PCM device */
-	snd_pcm_t *pcm;
+	struct alsa_pcm	alsa_pcm;
 	/* mixer for volume control */
-	snd_mixer_t *mixer;
-	snd_mixer_elem_t *mixer_elem;
-	bool mixer_has_mute_switch;
+	struct alsa_mixer alsa_mixer;
 	/* if true, playback is active */
-	bool active;
+	atomic_bool active;
 	/* human-readable BT address */
 	char addr[18];
 };
@@ -61,6 +85,7 @@ static unsigned int verbose = 0;
 static bool list_bt_devices = false;
 static bool list_bt_pcms = false;
 static const char *pcm_device = "default";
+static enum volume_type volume_type = VOL_TYPE_AUTO;
 static const char *mixer_device = "default";
 static const char *mixer_elem_name = "Master";
 static unsigned int mixer_elem_index = 0;
@@ -68,9 +93,8 @@ static bool ba_profile_a2dp = true;
 static bool ba_addr_any = false;
 static bdaddr_t *ba_addrs = NULL;
 static size_t ba_addrs_count = 0;
-static unsigned int pcm_buffer_time = 500000;
-static unsigned int pcm_period_time = 100000;
-static bool pcm_mixer = true;
+static unsigned int pcm_buffer_time = 0;
+static unsigned int pcm_period_time = 0;
 
 /* local PCM muted state for software mute */
 static bool pcm_muted = false;
@@ -81,20 +105,17 @@ static char dbus_ba_service[32] = BLUEALSA_SERVICE;
 static struct ba_pcm *ba_pcms = NULL;
 static size_t ba_pcms_count = 0;
 
+static pthread_mutex_t single_playback_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool force_single_playback = false;
+
 static pthread_rwlock_t workers_lock = PTHREAD_RWLOCK_INITIALIZER;
-static struct pcm_worker *workers = NULL;
+static struct io_worker *workers = NULL;
 static size_t workers_count = 0;
 static size_t workers_size = 0;
 
-static bool main_loop_on = true;
+static int main_loop_quit_event_fd = -1;
 static void main_loop_stop(int sig) {
-	/* Call to this handler restores the default action, so on the
-	 * second call the program will be forcefully terminated. */
-
-	struct sigaction sigact = { .sa_handler = SIG_DFL };
-	sigaction(sig, &sigact, NULL);
-
-	main_loop_on = false;
+	eventfd_write(main_loop_quit_event_fd, sig);
 }
 
 static int parse_bt_addresses(char *argv[], size_t count) {
@@ -103,8 +124,7 @@ static int parse_bt_addresses(char *argv[], size_t count) {
 	if ((ba_addrs = malloc(sizeof(*ba_addrs) * ba_addrs_count)) == NULL)
 		return -1;
 
-	size_t i;
-	for (i = 0; i < ba_addrs_count; i++) {
+	for (size_t i = 0; i < ba_addrs_count; i++) {
 		if (str2ba(argv[i], &ba_addrs[i]) != 0)
 			return errno = EINVAL, -1;
 		if (bacmp(&ba_addrs[i], BDADDR_ANY) == 0)
@@ -159,9 +179,9 @@ static void print_bt_device_list(void) {
 	};
 
 	const char *tmp;
-	size_t i, ii;
+	size_t ii;
 
-	for (i = 0; i < ARRAYSIZE(section); i++) {
+	for (size_t i = 0; i < ARRAYSIZE(section); i++) {
 		printf("%s\n", section[i].label);
 		for (ii = 0, tmp = ""; ii < ba_pcms_count; ii++) {
 
@@ -194,7 +214,7 @@ static void print_bt_device_list(void) {
 					pcm->codec.name,
 					snd_pcm_format_name(bluealsa_get_snd_pcm_format(pcm)),
 					pcm->channels, pcm->channels != 1 ? "s" : "",
-					pcm->sampling);
+					pcm->rate);
 
 		}
 	}
@@ -206,9 +226,8 @@ static void print_bt_pcm_list(void) {
 	DBusError err = DBUS_ERROR_INIT;
 	struct bluez_device dev = { 0 };
 	const char *tmp = "";
-	size_t i;
 
-	for (i = 0; i < ba_pcms_count; i++) {
+	for (size_t i = 0; i < ba_pcms_count; i++) {
 		struct ba_pcm *pcm = &ba_pcms[i];
 
 		if (strcmp(pcm->device_path, tmp) != 0) {
@@ -236,31 +255,44 @@ static void print_bt_pcm_list(void) {
 				pcm->codec.name,
 				snd_pcm_format_name(bluealsa_get_snd_pcm_format(pcm)),
 				pcm->channels, pcm->channels != 1 ? "s" : "",
-				pcm->sampling);
+				pcm->rate);
 
 	}
 
 }
 
-static struct ba_pcm *get_ba_pcm(const char *path) {
+static struct ba_pcm *ba_pcm_add(const struct ba_pcm *pcm) {
+	struct ba_pcm *tmp;
+	if ((tmp = realloc(ba_pcms, (ba_pcms_count + 1) * sizeof(*ba_pcms))) == NULL)
+		return NULL;
+	ba_pcms = tmp;
+	memcpy(&ba_pcms[ba_pcms_count], pcm, sizeof(*ba_pcms));
+	return &ba_pcms[ba_pcms_count++];
+}
 
-	size_t i;
-
-	for (i = 0; i < ba_pcms_count; i++)
+static struct ba_pcm *ba_pcm_get(const char *path) {
+	for (size_t i = 0; i < ba_pcms_count; i++)
 		if (strcmp(ba_pcms[i].pcm_path, path) == 0)
 			return &ba_pcms[i];
-
 	return NULL;
 }
 
-static struct pcm_worker *get_active_worker(void) {
+static void ba_pcm_remove(const char *path) {
+	for (size_t i = 0; i < ba_pcms_count; i++)
+		if (strcmp(ba_pcms[i].pcm_path, path) == 0) {
+			memmove(&ba_pcms[i], &ba_pcms[i + 1],
+					(ba_pcms_count - i - 1) * sizeof(*ba_pcms));
+			ba_pcms_count--;
+			break;
+		}
+}
 
-	struct pcm_worker *w = NULL;
-	size_t i;
+static struct io_worker *get_active_io_worker(void) {
 
 	pthread_rwlock_rdlock(&workers_lock);
 
-	for (i = 0; i < workers_count; i++)
+	struct io_worker *w = NULL;
+	for (size_t i = 0; i < workers_count; i++)
 		if (workers[i].active) {
 			w = &workers[i];
 			break;
@@ -303,70 +335,28 @@ final:
 }
 
 /**
- * Synchronize BlueALSA PCM volume with ALSA mixer element. */
-static int pcm_worker_mixer_volume_sync(
-		struct pcm_worker *worker,
+ * Update BlueALSA PCM volume according to ALSA mixer element. */
+static int io_worker_mixer_volume_sync_ba_pcm(
+		struct io_worker *worker,
 		struct ba_pcm *ba_pcm) {
 
-	/* skip sync in case of software volume */
-	if (ba_pcm->soft_volume)
-		return 0;
-
-	snd_mixer_elem_t *elem = worker->mixer_elem;
-	if (elem == NULL)
-		return 0;
+	unsigned int volume;
+	/* If mixer element does not support playback switch,
+	 * use our global muted state as a default value. */
+	bool muted = pcm_muted;
 
 	const int vmax = BA_PCM_VOLUME_MAX(ba_pcm);
-	long long volume_db_sum = 0;
-	bool muted = true;
+	if (alsa_mixer_get_volume(&worker->alsa_mixer, vmax, &volume, &muted) != 0)
+		return -1;
 
-	snd_mixer_selem_channel_id_t ch;
-	for (ch = 0; snd_mixer_selem_has_playback_channel(elem, ch) == 1; ch++) {
-
-		long ch_volume_db;
-		int ch_switch = 1;
-
-		int err;
-		if ((err = snd_mixer_selem_get_playback_dB(elem, 0, &ch_volume_db)) != 0) {
-			error("Couldn't get playback dB level: %s", snd_strerror(err));
-			return -1;
-		}
-
-		/* mute switch is an optional feature for a mixer element */
-		if ((worker->mixer_has_mute_switch = snd_mixer_selem_has_playback_switch(elem))) {
-			if ((err = snd_mixer_selem_get_playback_switch(elem, 0, &ch_switch)) != 0) {
-				error("Couldn't get playback switch: %s", snd_strerror(err));
-				return -1;
-			}
-		}
-
-		volume_db_sum += ch_volume_db;
-		if (ch_switch == 1)
-			muted = false;
-
+	for (size_t i = 0; i < ba_pcm->channels; i++) {
+		ba_pcm->volume[i].muted = muted;
+		ba_pcm->volume[i].volume = volume;
 	}
 
-	/* Safety check for undefined behavior from
-	 * out-of-bounds dB conversion. */
-	assert(volume_db_sum <= 0LL);
-
-	/* Convert dB to loudness using decibel formula and
-	 * round to the nearest integer. */
-	int volume = lround(pow(2, (0.01 * volume_db_sum / ch) / 10) * vmax);
-
-	/* If mixer element does not support playback switch,
-	 * use our global muted state. */
-	if (!worker->mixer_has_mute_switch)
-		muted = pcm_muted;
-
-	ba_pcm->volume.ch1_muted = muted;
-	ba_pcm->volume.ch1_volume = volume;
-	ba_pcm->volume.ch2_muted = muted;
-	ba_pcm->volume.ch2_volume = volume;
-
 	DBusError err = DBUS_ERROR_INIT;
-	if (!bluealsa_dbus_pcm_update(&dbus_ctx, ba_pcm, BLUEALSA_PCM_VOLUME, &err)) {
-		error("Couldn't update PCM: %s", err.message);
+	if (!ba_dbus_pcm_update(&dbus_ctx, ba_pcm, BLUEALSA_PCM_VOLUME, &err)) {
+		error("Couldn't update BlueALSA source PCM: %s", err.message);
 		dbus_error_free(&err);
 		return -1;
 	}
@@ -376,16 +366,15 @@ static int pcm_worker_mixer_volume_sync(
 
 /**
  * Update ALSA mixer element according to BlueALSA PCM volume. */
-static int pcm_worker_mixer_volume_update(
-		struct pcm_worker *worker,
+static int io_worker_mixer_volume_sync_alsa_mixer(
+		struct io_worker *worker,
 		struct ba_pcm *ba_pcm) {
 
 	/* skip update in case of software volume */
 	if (ba_pcm->soft_volume)
 		return 0;
 
-	snd_mixer_elem_t *elem = worker->mixer_elem;
-	if (elem == NULL)
+	if (!alsa_mixer_is_open(&worker->alsa_mixer))
 		return 0;
 
 	/* User can connect BlueALSA PCM to mono, stereo or multi-channel output.
@@ -395,38 +384,26 @@ static int pcm_worker_mixer_volume_update(
 	 * some kind of channel mapping. In order to simplify things, we will set
 	 * all channels to the average left-right volume. */
 
-	const int vmax = BA_PCM_VOLUME_MAX(ba_pcm);
-	int volume = ba_pcm->volume.ch1_volume;
-	int muted = ba_pcm->volume.ch1_muted;
-
-	if (ba_pcm->channels > 1) {
-		volume = (ba_pcm->volume.ch1_volume + ba_pcm->volume.ch2_volume) / 2;
-		muted = ba_pcm->volume.ch1_muted || ba_pcm->volume.ch2_muted;
+	unsigned int volume_sum = 0, muted = 0;
+	for (size_t i = 0; i < ba_pcm->channels; i++) {
+		volume_sum += ba_pcm->volume[i].volume;
+		muted |= ba_pcm->volume[i].muted;
 	}
 
 	/* keep local muted state up to date */
 	pcm_muted = muted;
 
-	/* convert loudness to dB using decibel formula */
-	long db = 10 * log2(1.0 * volume / vmax) * 100;
-
-	int err;
-	if ((err = snd_mixer_selem_set_playback_dB_all(elem, db, 0)) != 0) {
-		error("Couldn't set playback dB level: %s", snd_strerror(err));
-		return -1;
-	}
-
-	/* mute switch is an optional feature for a mixer element */
-	if (worker->mixer_has_mute_switch &&
-			(err = snd_mixer_selem_set_playback_switch_all(elem, !muted)) != 0) {
-		error("Couldn't set playback mute switch: %s", snd_strerror(err));
-		return -1;
-	}
-
-	return 0;
+	const unsigned int vmax = BA_PCM_VOLUME_MAX(ba_pcm);
+	const unsigned int volume = volume_sum / ba_pcm->channels;
+	return alsa_mixer_set_volume(&worker->alsa_mixer, vmax, volume, muted);
 }
 
-static void pcm_worker_routine_exit(struct pcm_worker *worker) {
+static void io_worker_mixer_event_callback(void *data) {
+	struct io_worker *worker = data;
+	io_worker_mixer_volume_sync_ba_pcm(worker, &worker->ba_pcm);
+}
+
+static void io_worker_routine_exit(struct io_worker *worker) {
 	if (worker->ba_pcm_fd != -1) {
 		close(worker->ba_pcm_fd);
 		worker->ba_pcm_fd = -1;
@@ -435,211 +412,305 @@ static void pcm_worker_routine_exit(struct pcm_worker *worker) {
 		close(worker->ba_pcm_ctrl_fd);
 		worker->ba_pcm_ctrl_fd = -1;
 	}
-	if (worker->pcm != NULL) {
-		snd_pcm_close(worker->pcm);
-		worker->pcm = NULL;
-	}
-	if (worker->mixer != NULL) {
-		snd_mixer_close(worker->mixer);
-		worker->mixer_elem = NULL;
-		worker->mixer = NULL;
-	}
-	debug("Exiting PCM worker %s", worker->addr);
+	alsa_pcm_close(&worker->alsa_pcm);
+	alsa_mixer_close(&worker->alsa_mixer);
+	debug("Exiting IO worker %s", worker->addr);
 }
 
-static void *pcm_worker_routine(struct pcm_worker *w) {
+static void *io_worker_routine(struct io_worker *w) {
 
-	snd_pcm_format_t pcm_format = bluealsa_get_snd_pcm_format(&w->ba_pcm);
-	ssize_t pcm_format_size = snd_pcm_format_size(pcm_format, 1);
-	size_t pcm_1s_samples = w->ba_pcm.sampling * w->ba_pcm.channels;
+	const snd_pcm_format_t pcm_format = bluealsa_get_snd_pcm_format(&w->ba_pcm);
+	const ssize_t pcm_format_size = snd_pcm_format_size(pcm_format, 1);
+	const size_t pcm_1s_samples = w->ba_pcm.rate * w->ba_pcm.channels;
 	ffb_t buffer = { 0 };
 
 	/* Cancellation should be possible only in the carefully selected place
 	 * in order to prevent memory leaks and resources not being released. */
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(pcm_worker_routine_exit), w);
+	pthread_cleanup_push(PTHREAD_CLEANUP(io_worker_routine_exit), w);
 	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &buffer);
 
-	/* create buffer big enough to hold 100 ms of PCM data */
-	if (ffb_init(&buffer, pcm_1s_samples / 10, pcm_format_size) == -1) {
+	/* Create a buffer big enough to hold enough PCM data for half the
+	 * requested PCM buffer time. This will be revised to match the actual
+	 * ALSA start threshold when the ALSA PCM is opened. */
+	const size_t nmemb = pcm_buffer_time * pcm_1s_samples / 1000000 / 2;
+	if (ffb_init(&buffer, nmemb, pcm_format_size) == -1) {
 		error("Couldn't create PCM buffer: %s", strerror(errno));
 		goto fail;
 	}
 
 	DBusError err = DBUS_ERROR_INIT;
-	if (!bluealsa_dbus_pcm_open(&dbus_ctx, w->ba_pcm.pcm_path,
+
+	/* initialize the PCM soft_volume setting */
+	if (volume_type != VOL_TYPE_AUTO) {
+		bool softvol = (volume_type == VOL_TYPE_SOFTWARE);
+		debug("Setting BlueALSA source PCM volume mode: %s: %s",
+				w->ba_pcm.pcm_path, softvol ? "software" : "pass-through");
+		if (softvol != w->ba_pcm.soft_volume) {
+			w->ba_pcm.soft_volume = softvol;
+			if (!ba_dbus_pcm_update(&dbus_ctx, &w->ba_pcm, BLUEALSA_PCM_SOFT_VOLUME, &err)) {
+				error("Couldn't set BlueALSA source PCM volume mode: %s", err.message);
+				dbus_error_free(&err);
+				goto fail;
+			}
+		}
+	}
+
+	debug("Opening BlueALSA source PCM: %s", w->ba_pcm.pcm_path);
+	if (!ba_dbus_pcm_open(&dbus_ctx, w->ba_pcm.pcm_path,
 				&w->ba_pcm_fd, &w->ba_pcm_ctrl_fd, &err)) {
-		error("Couldn't open PCM: %s", err.message);
+		error("Couldn't open BlueALSA source PCM: %s", err.message);
 		dbus_error_free(&err);
 		goto fail;
 	}
 
-	/* Initialize the max read length to 10 ms. Later, when the PCM device
-	 * will be opened, this value will be adjusted to one period size. */
-	size_t pcm_max_read_len_init = pcm_1s_samples / 100 * pcm_format_size;
-	size_t pcm_max_read_len = pcm_max_read_len_init;
+	/* Track the lock state of the single playback mutex within this thread. */
+	bool single_playback_mutex_locked = false;
+
+	/* Intervals in seconds between consecutive PCM open retry attempts. */
+	const unsigned int pcm_open_retry_intervals[] = { 1, 1, 2, 3, 5 };
+	size_t pcm_open_retry_pcm_samples = 0;
 	size_t pcm_open_retries = 0;
 
-	/* These variables determine how and when the pause command will be send
-	 * to the device player. In order not to flood BT connection with AVRCP
-	 * packets, we are going to send pause command every 0.5 second. */
-	size_t pause_threshold = pcm_1s_samples / 2 * pcm_format_size;
-	size_t pause_counter = 0;
-	size_t pause_bytes = 0;
+	struct delay_report dr;
+	delay_report_init(&dr, &dbus_ctx, &w->ba_pcm);
 
-	struct pollfd pfds[] = {{ w->ba_pcm_fd, POLLIN, 0 }};
+	size_t pause_retry_pcm_samples = pcm_1s_samples;
+	size_t pause_retries = 0;
+
 	int timeout = -1;
 
-	debug("Starting PCM loop");
-	while (main_loop_on) {
-		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+	debug("Starting IO loop");
+	for (;;) {
 
-		ssize_t ret;
+		if (single_playback_mutex_locked) {
+			pthread_mutex_unlock(&single_playback_mutex);
+			single_playback_mutex_locked = false;
+		}
+
+		struct pollfd fds[16] = {
+			{ main_loop_quit_event_fd, POLLIN, 0 },
+			{ w->ba_pcm_fd, POLLIN, 0 }};
+		nfds_t nfds = 2;
+
+		if (alsa_mixer_is_open(&w->alsa_mixer)) {
+			nfds += alsa_mixer_poll_descriptors_count(&w->alsa_mixer);
+			if (nfds <= ARRAYSIZE(fds))
+				alsa_mixer_poll_descriptors(&w->alsa_mixer, fds + 2, nfds - 2);
+			else {
+				error("Poll FD array size exceeded: %zu > %zu", nfds, ARRAYSIZE(fds));
+				goto fail;
+			}
+		}
 
 		/* Reading from the FIFO won't block unless there is an open connection
 		 * on the writing side. However, the server does not open PCM FIFO until
 		 * a transport is created. With the A2DP, the transport is created when
 		 * some clients (BT device) requests audio transfer. */
-		switch (poll(pfds, ARRAYSIZE(pfds), timeout)) {
+
+		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+		int poll_rv = poll(fds, nfds, timeout);
+		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+
+		switch (poll_rv) {
 		case -1:
 			if (errno == EINTR)
 				continue;
-			error("PCM FIFO poll error: %s", strerror(errno));
+			error("IO loop poll error: %s", strerror(errno));
 			goto fail;
 		case 0:
-			debug("Device marked as inactive: %s", w->addr);
-			pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-			pcm_max_read_len = pcm_max_read_len_init;
-			pause_counter = pause_bytes = 0;
-			ffb_rewind(&buffer);
-			if (w->pcm != NULL) {
-				snd_pcm_close(w->pcm);
-				w->pcm = NULL;
-			}
-			w->active = false;
-			timeout = -1;
-			continue;
+			if (!w->ba_pcm.running && ffb_len_out(&buffer) == 0)
+				goto device_inactive;
+			break;
 		}
 
-		/* FIFO has been terminated on the writing side */
-		if (pfds[0].revents & POLLHUP)
+		if (fds[0].revents & POLLIN)
 			break;
 
-		#define MIN(a, b) a < b ? a : b
-		size_t _in = MIN(pcm_max_read_len, ffb_blen_in(&buffer));
-		if ((ret = read(w->ba_pcm_fd, buffer.tail, _in)) == -1) {
-			if (errno == EINTR)
-				continue;
-			error("PCM FIFO read error: %s", strerror(errno));
-			goto fail;
+		if (alsa_mixer_is_open(&w->alsa_mixer))
+			alsa_mixer_handle_events(&w->alsa_mixer);
+
+		size_t read_samples = 0;
+		if (fds[1].revents & POLLIN) {
+
+			/* If the internal buffer is full then we have an overrun. We must
+			 * discard audio frames in order to continue reading fresh data
+			 * from the server. */
+			if (ffb_blen_in(&buffer) == 0) {
+				unsigned int buffered = 0;
+				ioctl(w->ba_pcm_fd, FIONREAD, &buffered);
+				const size_t discard_bytes = MIN(buffered, ffb_blen_out(&buffer));
+				const size_t discard_samples = discard_bytes / pcm_format_size;
+				warn("Dropping PCM frames: %zu", discard_samples / w->ba_pcm.channels);
+				ffb_shift(&buffer, discard_samples);
+			}
+
+			ssize_t ret;
+			if ((ret = read(w->ba_pcm_fd, buffer.tail, ffb_blen_in(&buffer))) == -1) {
+				if (errno == EINTR)
+					continue;
+				error("BlueALSA source PCM read error: %s", strerror(errno));
+				goto fail;
+			}
+
+			read_samples = ret / pcm_format_size;
+			if (ret % pcm_format_size != 0)
+				warn("Invalid read from BlueALSA source PCM: %zd %% %zd != 0", ret, pcm_format_size);
+
+			ffb_seek(&buffer, read_samples);
+
 		}
+		else if (fds[1].revents & POLLHUP) {
+			/* source PCM FIFO has been terminated on the writing side */
+			debug("BlueALSA source PCM disconnected: %s", w->ba_pcm.pcm_path);
+			break;
+		}
+		else if (fds[1].revents)
+			error("Unexpected BlueALSA source PCM poll event: %#x", fds[1].revents);
 
-		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+		/* If current worker is not active and the single playback mode was
+		 * enabled, we have to check if there is any other active worker. */
+		if (force_single_playback && !w->active) {
 
-		/* If PCM mixer is disabled, check whether we should play audio. */
-		if (!pcm_mixer) {
-			struct pcm_worker *worker = get_active_worker();
-			if (worker != NULL && worker != w) {
-				if (pause_counter < 5 && (pause_bytes += ret) > pause_threshold) {
+			/* Before checking active worker, we need to lock the single playback
+			 * mutex. It is required to lock it, because the active state is changed
+			 * in the worker thread after opening the PCM device, so we have to
+			 * synchronize all threads at this point. */
+			pthread_mutex_lock(&single_playback_mutex);
+			single_playback_mutex_locked = true;
+
+			if (get_active_io_worker() != NULL) {
+				/* In order not to flood BT connection with AVRCP packets,
+				 * we are going to send pause command every 0.5 second. */
+				if (pause_retries < 5 &&
+						(pause_retry_pcm_samples += read_samples) > pcm_1s_samples / 2) {
 					if (pause_device_player(&w->ba_pcm) == -1)
 						/* pause command does not work, stop further requests */
-						pause_counter = 5;
-					pause_counter++;
-					pause_bytes = 0;
+						pause_retries = 5;
+					pause_retry_pcm_samples = 0;
+					pause_retries++;
 					timeout = 100;
 				}
 				continue;
 			}
+
 		}
 
-		if (w->pcm == NULL) {
+		if (!alsa_pcm_is_open(&w->alsa_pcm)) {
 
-			unsigned int buffer_time = pcm_buffer_time;
-			unsigned int period_time = pcm_period_time;
-			snd_pcm_uframes_t buffer_size;
-			snd_pcm_uframes_t period_size;
+			if (pcm_open_retries > 0) {
+				/* After PCM open failure wait some time before retry. This can not be
+				 * done with a sleep() call, because we have to drain PCM FIFO, so it
+				 * will not have any stale data. */
+				unsigned int interval = pcm_open_retries > ARRAYSIZE(pcm_open_retry_intervals) ?
+					pcm_open_retry_intervals[ARRAYSIZE(pcm_open_retry_intervals) - 1] :
+					pcm_open_retry_intervals[pcm_open_retries - 1];
+				if ((pcm_open_retry_pcm_samples += read_samples) <= interval * pcm_1s_samples)
+					continue;
+			}
+
+			debug("Opening ALSA playback PCM: name=%s channels=%u rate=%u",
+					pcm_device, w->ba_pcm.channels, w->ba_pcm.rate);
+
 			char *tmp;
-
-			/* After PCM open failure wait one second before retry. This can not be
-			 * done with a single sleep() call, because we have to drain PCM FIFO. */
-			if (pcm_open_retries++ % 20 != 0) {
-				usleep(50000);
-				continue;
-			}
-
-			if (alsa_pcm_open(&w->pcm, pcm_device, pcm_format, w->ba_pcm.channels,
-						w->ba_pcm.sampling, &buffer_time, &period_time, &tmp) != 0) {
-				warn("Couldn't open PCM: %s", tmp);
-				pcm_max_read_len = pcm_max_read_len_init;
-				usleep(50000);
+			if (alsa_pcm_open(&w->alsa_pcm, pcm_device, pcm_format, w->ba_pcm.channels,
+						w->ba_pcm.rate, pcm_buffer_time, pcm_period_time, 0, &tmp) != 0) {
+				warn("Couldn't open ALSA playback PCM: %s", tmp);
+				pcm_open_retry_pcm_samples = 0;
+				pcm_open_retries++;
 				free(tmp);
 				continue;
 			}
 
-			if (alsa_mixer_open(&w->mixer, &w->mixer_elem,
-						mixer_device, mixer_elem_name, mixer_elem_index, &tmp) != 0) {
-				warn("Couldn't open mixer: %s", tmp);
-				free(tmp);
+			/* Resize the internal buffer to ensure it is not less than the
+			 * ALSA start threshold. This is to ensure that the PCM re-starts
+			 * quickly after an overrun. */
+			if (w->alsa_pcm.start_threshold > buffer.nmemb / w->ba_pcm.channels)
+				ffb_init(&buffer, w->alsa_pcm.start_threshold * w->ba_pcm.channels, buffer.size);
+
+			/* Skip mixer setup in case of software volume. */
+			if (mixer_device != NULL && !w->ba_pcm.soft_volume) {
+				debug("Opening ALSA mixer: name=%s elem=%s index=%u",
+						mixer_device, mixer_elem_name, mixer_elem_index);
+				if (alsa_mixer_open(&w->alsa_mixer, mixer_device,
+							mixer_elem_name, mixer_elem_index, &tmp) == 0)
+					io_worker_mixer_volume_sync_ba_pcm(w, &w->ba_pcm);
+				else {
+					warn("Couldn't open ALSA mixer: %s", tmp);
+					free(tmp);
+				}
 			}
 
-			/* initial volume synchronization */
-			pcm_worker_mixer_volume_sync(w, &w->ba_pcm);
-
-			snd_pcm_get_params(w->pcm, &buffer_size, &period_size);
-			pcm_max_read_len = period_size * w->ba_pcm.channels * pcm_format_size;
+			/* Reset retry counters. */
+			pcm_open_retry_pcm_samples = 0;
 			pcm_open_retries = 0;
 
+			/* Reset moving delay window buffer. */
+			delay_report_reset(&dr);
+
 			if (verbose >= 2) {
-				printf("Used configuration for %s:\n"
-						"  PCM buffer time: %u us (%zu bytes)\n"
-						"  PCM period time: %u us (%zu bytes)\n"
-						"  PCM format: %s\n"
-						"  Sampling rate: %u Hz\n"
-						"  Channels: %u\n",
+				info("Used configuration for %s:\n"
+						"  ALSA PCM buffer time: %u us (%zu bytes)\n"
+						"  ALSA PCM period time: %u us (%zu bytes)\n"
+						"  ALSA PCM format: %s\n"
+						"  ALSA PCM sample rate: %u Hz\n"
+						"  ALSA PCM channels: %u",
 						w->addr,
-						buffer_time, snd_pcm_frames_to_bytes(w->pcm, buffer_size),
-						period_time, snd_pcm_frames_to_bytes(w->pcm, period_size),
-						snd_pcm_format_name(pcm_format),
-						w->ba_pcm.sampling,
-						w->ba_pcm.channels);
+						w->alsa_pcm.buffer_time, alsa_pcm_frames_to_bytes(&w->alsa_pcm, w->alsa_pcm.buffer_frames),
+						w->alsa_pcm.period_time, alsa_pcm_frames_to_bytes(&w->alsa_pcm, w->alsa_pcm.period_frames),
+						snd_pcm_format_name(w->alsa_pcm.format),
+						w->alsa_pcm.rate,
+						w->alsa_pcm.channels);
 			}
+
+			if (verbose >= 3)
+				alsa_pcm_dump(&w->alsa_pcm, stderr);
 
 		}
 
-		/* mark device as active and set timeout to 500ms */
+		/* Mark device as active and set timeout to the period time. */
+		timeout = w->alsa_pcm.period_time / 1000;
 		w->active = true;
-		timeout = 500;
 
-		ffb_seek(&buffer, ret / pcm_format_size);
+		/* Current worker was marked as active, so we can safely
+		 * release the single playback mutex if it was locked. */
+		if (single_playback_mutex_locked) {
+			pthread_mutex_unlock(&single_playback_mutex);
+			single_playback_mutex_locked = false;
+		}
 
-		/* calculate the overall number of frames in the buffer */
-		size_t samples = ffb_len_out(&buffer);
-		snd_pcm_sframes_t frames = samples / w->ba_pcm.channels;
+		if (!w->alsa_mixer.has_mute_switch && pcm_muted)
+			snd_pcm_format_set_silence(pcm_format, buffer.data, ffb_len_out(&buffer));
 
-		if (!w->mixer_has_mute_switch && pcm_muted)
-			snd_pcm_format_set_silence(pcm_format, buffer.data, samples);
+		if (alsa_pcm_write(&w->alsa_pcm, &buffer, !w->ba_pcm.running, verbose) < 0)
+			goto close_alsa;
 
-		if ((frames = snd_pcm_writei(w->pcm, buffer.data, frames)) < 0)
-			switch (-frames) {
-			case EPIPE:
-				debug("An underrun has occurred");
-				snd_pcm_prepare(w->pcm);
-				usleep(50000);
-				frames = 0;
-				break;
-			default:
-				error("Couldn't write to PCM: %s", snd_strerror(frames));
-				goto fail;
-			}
+		if (!w->ba_pcm.running)
+			goto device_inactive;
 
-		/* move leftovers to the beginning and reposition tail */
-		ffb_shift(&buffer, frames * w->ba_pcm.channels);
+		if (!delay_report_update(&dr, &w->alsa_pcm, w->ba_pcm_fd, &buffer, &err)) {
+			error("Couldn't update BlueALSA PCM client delay: %s", err.message);
+			dbus_error_free(&err);
+			goto fail;
+		}
 
+		continue;
+
+device_inactive:
+		debug("BT device marked as inactive: %s", w->addr);
+		pause_retry_pcm_samples = pcm_1s_samples;
+		pause_retries = 0;
+		w->active = false;
+		timeout = -1;
+
+close_alsa:
+		ffb_rewind(&buffer);
+		alsa_pcm_close(&w->alsa_pcm);
+		alsa_mixer_close(&w->alsa_mixer);
 	}
 
 fail:
-	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
 	return NULL;
@@ -652,22 +723,22 @@ static bool pcm_hw_params_equal(
 		return false;
 	if (ba_pcm_1->channels != ba_pcm_2->channels)
 		return false;
-	if (ba_pcm_1->sampling != ba_pcm_2->sampling)
+	if (ba_pcm_1->rate != ba_pcm_2->rate)
 		return false;
 	return true;
 }
 
 /**
  * Stop the worker thread at workers[index]. */
-static void pcm_worker_stop(size_t index) {
+static void io_worker_stop(size_t index) {
 
 	/* Safety check for out-of-bounds read. */
 	assert(index < workers_count);
 
-	pthread_rwlock_wrlock(&workers_lock);
-
 	pthread_cancel(workers[index].thread);
 	pthread_join(workers[index].thread, NULL);
+
+	pthread_rwlock_wrlock(&workers_lock);
 
 	if (index != --workers_count)
 		/* Move the last worker in the array to position
@@ -678,70 +749,65 @@ static void pcm_worker_stop(size_t index) {
 
 }
 
-static struct pcm_worker *supervise_pcm_worker_start(const struct ba_pcm *ba_pcm) {
+static struct io_worker *supervise_io_worker_start(const struct ba_pcm *ba_pcm) {
 
-	size_t i;
-	for (i = 0; i < workers_count; i++)
+	for (size_t i = 0; i < workers_count; i++)
 		if (strcmp(workers[i].ba_pcm.pcm_path, ba_pcm->pcm_path) == 0) {
 			/* If the codec has changed after the device connected, then the
 			 * audio format may have changed. If it has, the worker thread
-			 * needs to be restarted. */
+			 * needs to be restarted. Otherwise, update the running state. */
 			if (!pcm_hw_params_equal(&workers[i].ba_pcm, ba_pcm))
-				pcm_worker_stop(i);
-			else
+				io_worker_stop(i);
+			else {
+				workers[i].ba_pcm.running = ba_pcm->running;
 				return &workers[i];
+			}
 		}
 
 	pthread_rwlock_wrlock(&workers_lock);
 
 	workers_count++;
 	if (workers_size < workers_count) {
-		struct pcm_worker *tmp = workers;
+		struct io_worker *tmp = workers;
 		workers_size += 4;  /* coarse-grained realloc */
 		if ((workers = realloc(workers, sizeof(*workers) * workers_size)) == NULL) {
-			error("Couldn't (re)allocate memory for PCM workers: %s", strerror(ENOMEM));
+			error("Couldn't (re)allocate memory for IO workers: %s", strerror(ENOMEM));
 			workers = tmp;
 			pthread_rwlock_unlock(&workers_lock);
 			return NULL;
 		}
 	}
 
-	struct pcm_worker *worker = &workers[workers_count - 1];
+	struct io_worker *worker = &workers[workers_count - 1];
 	memcpy(&worker->ba_pcm, ba_pcm, sizeof(worker->ba_pcm));
 	ba2str(&worker->ba_pcm.addr, worker->addr);
-	worker->active = false;
 	worker->ba_pcm_fd = -1;
 	worker->ba_pcm_ctrl_fd = -1;
-	worker->pcm = NULL;
-	worker->mixer = NULL;
-	worker->mixer_elem = NULL;
-	worker->mixer_has_mute_switch = false;
+	alsa_pcm_init(&worker->alsa_pcm);
+	alsa_mixer_init(&worker->alsa_mixer, io_worker_mixer_event_callback, worker);
+	worker->active = false;
+
+	debug("Creating IO worker %s", worker->addr);
+	if ((errno = pthread_create(&worker->thread, NULL,
+					PTHREAD_FUNC(io_worker_routine), worker)) != 0) {
+		error("Couldn't create IO worker %s: %s", worker->addr, strerror(errno));
+		workers_count--;
+		worker = NULL;
+	}
 
 	pthread_rwlock_unlock(&workers_lock);
-
-	debug("Creating PCM worker %s", worker->addr);
-
-	if ((errno = pthread_create(&worker->thread, NULL,
-					PTHREAD_ROUTINE(pcm_worker_routine), worker)) != 0) {
-		error("Couldn't create PCM worker %s: %s", worker->addr, strerror(errno));
-		workers_count--;
-		return NULL;
-	}
 
 	return worker;
 }
 
-static struct pcm_worker *supervise_pcm_worker_stop(const struct ba_pcm *ba_pcm) {
-
-	size_t i;
-	for (i = 0; i < workers_count; i++)
+static struct io_worker *supervise_io_worker_stop(const struct ba_pcm *ba_pcm) {
+	for (size_t i = 0; i < workers_count; i++)
 		if (strcmp(workers[i].ba_pcm.pcm_path, ba_pcm->pcm_path) == 0)
-			pcm_worker_stop(i);
-
+			io_worker_stop(i);
 	return NULL;
 }
 
-static struct pcm_worker *supervise_pcm_worker(const struct ba_pcm *ba_pcm) {
+static struct io_worker *supervise_io_worker(const struct ba_pcm *ba_pcm) {
 
 	if (ba_pcm == NULL)
 		return NULL;
@@ -755,7 +821,7 @@ static struct pcm_worker *supervise_pcm_worker(const struct ba_pcm *ba_pcm) {
 
 	/* check whether SCO has selected codec */
 	if (ba_pcm->transport & BA_PCM_TRANSPORT_MASK_SCO &&
-			ba_pcm->sampling == 0) {
+			ba_pcm->rate == 0) {
 		debug("Skipping SCO with codec not selected");
 		goto stop;
 	}
@@ -763,15 +829,14 @@ static struct pcm_worker *supervise_pcm_worker(const struct ba_pcm *ba_pcm) {
 	if (ba_addr_any)
 		goto start;
 
-	size_t i;
-	for (i = 0; i < ba_addrs_count; i++)
+	for (size_t i = 0; i < ba_addrs_count; i++)
 		if (bacmp(&ba_addrs[i], &ba_pcm->addr) == 0)
 			goto start;
 
 stop:
-	return supervise_pcm_worker_stop(ba_pcm);
+	return supervise_io_worker_stop(ba_pcm);
 start:
-	return supervise_pcm_worker_start(ba_pcm);
+	return supervise_io_worker_start(ba_pcm);
 }
 
 static DBusHandlerResult dbus_signal_handler(DBusConnection *conn, DBusMessage *message, void *data) {
@@ -786,7 +851,7 @@ static DBusHandlerResult dbus_signal_handler(DBusConnection *conn, DBusMessage *
 	const char *signal = dbus_message_get_member(message);
 
 	DBusMessageIter iter;
-	struct pcm_worker *worker;
+	struct io_worker *worker;
 
 	if (strcmp(interface, DBUS_INTERFACE_OBJECT_MANAGER) == 0) {
 
@@ -795,35 +860,33 @@ static DBusHandlerResult dbus_signal_handler(DBusConnection *conn, DBusMessage *
 				goto fail;
 			struct ba_pcm pcm;
 			DBusError err = DBUS_ERROR_INIT;
-			if (!bluealsa_dbus_message_iter_get_pcm(&iter, &err, &pcm)) {
-				error("Couldn't add new PCM: %s", err.message);
+			if (!dbus_message_iter_get_ba_pcm(&iter, &err, &pcm)) {
+				error("Couldn't add new BlueALSA PCM: %s", err.message);
 				dbus_error_free(&err);
 				goto fail;
 			}
 			if (pcm.transport == BA_PCM_TRANSPORT_NONE)
 				goto fail;
-			struct ba_pcm *tmp = ba_pcms;
-			if ((ba_pcms = realloc(ba_pcms, (ba_pcms_count + 1) * sizeof(*ba_pcms))) == NULL) {
-				error("Couldn't add new PCM: %s", strerror(ENOMEM));
-				ba_pcms = tmp;
+			if (ba_pcm_add(&pcm) == NULL) {
+				error("Couldn't add new BlueALSA PCM: %s", strerror(errno));
 				goto fail;
 			}
-			memcpy(&ba_pcms[ba_pcms_count++], &pcm, sizeof(*ba_pcms));
-			supervise_pcm_worker(&pcm);
+			supervise_io_worker(&pcm);
 			return DBUS_HANDLER_RESULT_HANDLED;
 		}
 
 		if (strcmp(signal, "InterfacesRemoved") == 0) {
 			if (!dbus_message_iter_init(message, &iter) ||
 					dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_OBJECT_PATH) {
-				error("Couldn't remove PCM: %s", "Invalid signal signature");
+				error("Couldn't remove BlueALSA PCM: %s", "Invalid signal signature");
 				goto fail;
 			}
 			dbus_message_iter_get_basic(&iter, &path);
 			struct ba_pcm *pcm;
-			if ((pcm = get_ba_pcm(path)) == NULL)
+			if ((pcm = ba_pcm_get(path)) == NULL)
 				goto fail;
-			supervise_pcm_worker_stop(pcm);
+			supervise_io_worker_stop(pcm);
+			ba_pcm_remove(path);
 			return DBUS_HANDLER_RESULT_HANDLED;
 		}
 
@@ -831,19 +894,19 @@ static DBusHandlerResult dbus_signal_handler(DBusConnection *conn, DBusMessage *
 
 	if (strcmp(interface, DBUS_INTERFACE_PROPERTIES) == 0) {
 		struct ba_pcm *pcm;
-		if ((pcm = get_ba_pcm(path)) == NULL)
+		if ((pcm = ba_pcm_get(path)) == NULL)
 			goto fail;
 		if (!dbus_message_iter_init(message, &iter) ||
 				dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_STRING) {
-			error("Couldn't update PCM: %s", "Invalid signal signature");
+			error("Couldn't update BlueALSA PCM: %s", "Invalid signal signature");
 			goto fail;
 		}
 		dbus_message_iter_get_basic(&iter, &interface);
 		dbus_message_iter_next(&iter);
-		if (!bluealsa_dbus_message_iter_get_pcm_props(&iter, NULL, pcm))
+		if (!dbus_message_iter_get_ba_pcm_props(&iter, NULL, pcm))
 			goto fail;
-		if ((worker = supervise_pcm_worker(pcm)) != NULL)
-			pcm_worker_mixer_volume_update(worker, pcm);
+		if ((worker = supervise_io_worker(pcm)) != NULL)
+			io_worker_mixer_volume_sync_alsa_mixer(worker, pcm);
 		return DBUS_HANDLER_RESULT_HANDLED;
 	}
 
@@ -854,10 +917,12 @@ fail:
 int main(int argc, char *argv[]) {
 
 	int opt;
-	const char *opts = "hVvlLB:D:M:";
+	const char *opts = "hVSvlLB:D:M:";
 	const struct option longopts[] = {
 		{ "help", no_argument, NULL, 'h' },
 		{ "version", no_argument, NULL, 'V' },
+		{ "syslog", no_argument, NULL, 'S' },
+		{ "loglevel", required_argument, NULL, 9 },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "list-devices", no_argument, NULL, 'l' },
 		{ "list-pcms", no_argument, NULL, 'L' },
@@ -865,6 +930,7 @@ int main(int argc, char *argv[]) {
 		{ "pcm", required_argument, NULL, 'D' },
 		{ "pcm-buffer-time", required_argument, NULL, 3 },
 		{ "pcm-period-time", required_argument, NULL, 4 },
+		{ "volume", required_argument, NULL, '8' },
 		{ "mixer-device", required_argument, NULL, 'M' },
 		{ "mixer-name", required_argument, NULL, 6 },
 		{ "mixer-index", required_argument, NULL, 7 },
@@ -874,6 +940,13 @@ int main(int argc, char *argv[]) {
 		{ 0, 0, 0, 0 },
 	};
 
+	bool syslog = false;
+	const char *volume_type_str = "auto";
+
+	/* Check if syslog forwarding has been enabled. This check has to be
+	 * done before anything else, so we can log early stage warnings and
+	 * errors. */
+	opterr = 0;
 	while ((opt = getopt_long(argc, argv, opts, longopts, NULL)) != -1)
 		switch (opt) {
 		case 'h' /* --help */ :
@@ -882,6 +955,8 @@ int main(int argc, char *argv[]) {
 					"\nOptions:\n"
 					"  -h, --help\t\t\tprint this help and exit\n"
 					"  -V, --version\t\t\tprint version and exit\n"
+					"  -S, --syslog\t\t\tsend output to syslog\n"
+					"  --loglevel=LEVEL\t\tminimum message priority\n"
 					"  -v, --verbose\t\t\tmake output more verbose\n"
 					"  -l, --list-devices\t\tlist available BT audio devices\n"
 					"  -L, --list-pcms\t\tlist available BT audio PCMs\n"
@@ -889,9 +964,10 @@ int main(int argc, char *argv[]) {
 					"  -D, --pcm=NAME\t\tplayback PCM device to use\n"
 					"  --pcm-buffer-time=INT\t\tplayback PCM buffer time\n"
 					"  --pcm-period-time=INT\t\tplayback PCM period time\n"
+					"  --volume=TYPE\t\t\tvolume control type [auto|mixer|none|software]\n"
 					"  -M, --mixer-device=NAME\tmixer device to use\n"
 					"  --mixer-name=NAME\t\tmixer element name\n"
-					"  --mixer-index=NUM\t\tmixer element channel index\n"
+					"  --mixer-index=NUM\t\tmixer element index\n"
 					"  --profile-a2dp\t\tuse A2DP profile (default)\n"
 					"  --profile-sco\t\t\tuse SCO profile\n"
 					"  --single-audio\t\tsingle audio mode\n"
@@ -907,9 +983,49 @@ int main(int argc, char *argv[]) {
 			printf("%s\n", PACKAGE_VERSION);
 			return EXIT_SUCCESS;
 
+		case 'S' /* --syslog */ :
+			syslog = true;
+			break;
+
 		case 'v' /* --verbose */ :
 			verbose++;
 			break;
+		}
+
+	log_open(basename(argv[0]), syslog);
+	dbus_threads_init_default();
+
+	/* parse options */
+	optind = 0; opterr = 1;
+	while ((opt = getopt_long(argc, argv, opts, longopts, NULL)) != -1)
+		switch (opt) {
+		case 'h' /* --help */ :
+		case 'V' /* --version */ :
+		case 'S' /* --syslog */ :
+		case 'v' /* --verbose */ :
+			break;
+
+		case 9 /* --loglevel=LEVEL */ : {
+
+			static const nv_entry_t values[] = {
+				{ "error", .v.ui = LOG_ERR },
+				{ "warning", .v.ui = LOG_WARNING },
+				{ "info", .v.ui = LOG_INFO },
+#if DEBUG
+				{ "debug", .v.ui = LOG_DEBUG },
+#endif
+				{ 0 },
+			};
+
+			const nv_entry_t *entry;
+			if ((entry = nv_find(values, optarg)) == NULL) {
+				error("Invalid loglevel {%s}: %s", nv_join_names(values), optarg);
+				return EXIT_FAILURE;
+			}
+
+			log_set_min_priority(entry->v.ui);
+			break;
+		}
 
 		case 'l' /* --list-devices */ :
 			list_bt_devices = true;
@@ -936,6 +1052,28 @@ int main(int argc, char *argv[]) {
 			pcm_period_time = atoi(optarg);
 			break;
 
+		case '8' /* --volume */ : {
+
+			static const nv_entry_t values[] = {
+				{ "auto", .v.ui = VOL_TYPE_AUTO },
+				{ "mixer", .v.ui = VOL_TYPE_MIXER },
+				{ "software", .v.ui = VOL_TYPE_SOFTWARE },
+				{ "none", .v.ui = VOL_TYPE_NONE },
+				{ 0 },
+			};
+
+			const nv_entry_t *entry;
+			if ((entry = nv_find(values, optarg)) == NULL) {
+				error("Invalid volume control type {%s}: %s",
+						nv_join_names(values), optarg);
+				return EXIT_FAILURE;
+			}
+
+			volume_type_str = optarg;
+			volume_type = entry->v.ui;
+			break;
+		}
+
 		case 'M' /* --mixer-device=NAME */ :
 			mixer_device = optarg;
 			break;
@@ -954,7 +1092,7 @@ int main(int argc, char *argv[]) {
 			break;
 
 		case 5 /* --single-audio */ :
-			pcm_mixer = false;
+			force_single_playback = true;
 			break;
 
 		default:
@@ -962,18 +1100,20 @@ int main(int argc, char *argv[]) {
 			return EXIT_FAILURE;
 		}
 
-	log_open(argv[0], false);
-	dbus_threads_init_default();
+	if ((main_loop_quit_event_fd = eventfd(0, EFD_CLOEXEC)) == -1) {
+		error("Couldn't create quit event: %s", strerror(errno));
+		return EXIT_FAILURE;
+	}
 
 	DBusError err = DBUS_ERROR_INIT;
-	if (!bluealsa_dbus_connection_ctx_init(&dbus_ctx, dbus_ba_service, &err)) {
+	if (!ba_dbus_connection_ctx_init(&dbus_ctx, dbus_ba_service, &err)) {
 		error("Couldn't initialize D-Bus context: %s", err.message);
 		return EXIT_FAILURE;
 	}
 
 	if (list_bt_devices || list_bt_pcms) {
 
-		if (!bluealsa_dbus_get_pcms(&dbus_ctx, &ba_pcms, &ba_pcms_count, &err)) {
+		if (!ba_dbus_pcm_get_all(&dbus_ctx, &ba_pcms, &ba_pcms_count, &err)) {
 			warn("Couldn't get BlueALSA PCM list: %s", err.message);
 			return EXIT_FAILURE;
 		}
@@ -994,40 +1134,63 @@ int main(int argc, char *argv[]) {
 		return EXIT_FAILURE;
 	}
 
+	if (volume_type == VOL_TYPE_NONE || volume_type == VOL_TYPE_SOFTWARE)
+		mixer_device = NULL;
+
+	if (pcm_buffer_time == 0) {
+		if (pcm_period_time == 0)
+			pcm_period_time = ba_profile_a2dp ?
+				DEFAULT_PERIOD_TIME_A2DP : DEFAULT_PERIOD_TIME_SCO;
+		pcm_buffer_time = pcm_period_time * DEFAULT_PERIODS;
+	}
+	else if (pcm_period_time == 0) {
+		pcm_period_time = pcm_buffer_time / DEFAULT_PERIODS;
+	}
+
 	if (verbose >= 1) {
 
 		char *ba_str = malloc(19 * ba_addrs_count + 1);
 		char *tmp = ba_str;
-		size_t i;
 
-		for (i = 0; i < ba_addrs_count; i++, tmp += 19)
+		for (size_t i = 0; i < ba_addrs_count; i++, tmp += 19)
 			ba2str(&ba_addrs[i], stpcpy(tmp, ", "));
 
-		printf("Selected configuration:\n"
+		const char *mixer_device_str = "(not used)";
+		char mixer_element_str[128] = "(not used)";
+		if (mixer_device != NULL) {
+			mixer_device_str = mixer_device;
+			snprintf(mixer_element_str, sizeof(mixer_element_str), "'%s',%u",
+					mixer_elem_name, mixer_elem_index);
+		}
+
+		info("Selected configuration:\n"
 				"  BlueALSA service: %s\n"
-				"  PCM device: %s\n"
-				"  PCM buffer time: %u us\n"
-				"  PCM period time: %u us\n"
+				"  ALSA PCM device: %s\n"
+				"  ALSA PCM buffer time: %u us\n"
+				"  ALSA PCM period time: %u us\n"
 				"  ALSA mixer device: %s\n"
-				"  ALSA mixer element: '%s',%u\n"
+				"  ALSA mixer element: %s\n"
+				"  Volume control type: %s\n"
 				"  Bluetooth device(s): %s\n"
-				"  Profile: %s\n",
+				"  Profile: %s",
 				dbus_ba_service,
 				pcm_device, pcm_buffer_time, pcm_period_time,
-				mixer_device, mixer_elem_name, mixer_elem_index,
+				mixer_device_str,
+				mixer_element_str,
+				volume_type_str,
 				ba_addr_any ? "ANY" : &ba_str[2],
 				ba_profile_a2dp ? "A2DP" : "SCO");
 
 		free(ba_str);
 	}
 
-	bluealsa_dbus_connection_signal_match_add(&dbus_ctx,
+	ba_dbus_connection_signal_match_add(&dbus_ctx,
 			dbus_ba_service, NULL, DBUS_INTERFACE_OBJECT_MANAGER, "InterfacesAdded",
 			"path_namespace='/org/bluealsa'");
-	bluealsa_dbus_connection_signal_match_add(&dbus_ctx,
+	ba_dbus_connection_signal_match_add(&dbus_ctx,
 			dbus_ba_service, NULL, DBUS_INTERFACE_OBJECT_MANAGER, "InterfacesRemoved",
 			"path_namespace='/org/bluealsa'");
-	bluealsa_dbus_connection_signal_match_add(&dbus_ctx,
+	ba_dbus_connection_signal_match_add(&dbus_ctx,
 			dbus_ba_service, NULL, DBUS_INTERFACE_PROPERTIES, "PropertiesChanged",
 			"arg0='"BLUEALSA_INTERFACE_PCM"'");
 
@@ -1036,37 +1199,49 @@ int main(int argc, char *argv[]) {
 		return EXIT_FAILURE;
 	}
 
-	if (!bluealsa_dbus_get_pcms(&dbus_ctx, &ba_pcms, &ba_pcms_count, &err))
+	if (!ba_dbus_pcm_get_all(&dbus_ctx, &ba_pcms, &ba_pcms_count, &err))
 		warn("Couldn't get BlueALSA PCM list: %s", err.message);
 
-	size_t i;
-	for (i = 0; i < ba_pcms_count; i++)
-		supervise_pcm_worker(&ba_pcms[i]);
+	for (size_t i = 0; i < ba_pcms_count; i++)
+		supervise_io_worker(&ba_pcms[i]);
 
-	struct sigaction sigact = { .sa_handler = main_loop_stop };
+	struct sigaction sigact = {
+		.sa_handler = main_loop_stop,
+		.sa_flags = SA_RESETHAND };
+	/* Call to these handlers restores the default action, so on the
+	 * second call the program will be forcefully terminated. */
 	sigaction(SIGTERM, &sigact, NULL);
 	sigaction(SIGINT, &sigact, NULL);
 
 	debug("Starting main loop");
-	while (main_loop_on) {
+	for (;;) {
 
-		struct pollfd pfds[10];
-		nfds_t pfds_len = ARRAYSIZE(pfds);
+		struct pollfd fds[10] = {
+			{ main_loop_quit_event_fd, POLLIN, 0 } };
+		nfds_t nfds = ARRAYSIZE(fds) - 1;
 
-		if (!bluealsa_dbus_connection_poll_fds(&dbus_ctx, pfds, &pfds_len)) {
+		if (!ba_dbus_connection_poll_fds(&dbus_ctx, &fds[1], &nfds)) {
 			error("Couldn't get D-Bus connection file descriptors");
 			return EXIT_FAILURE;
 		}
 
-		if (poll(pfds, pfds_len, -1) == -1 &&
+		if (poll(fds, nfds + 1, -1) == -1 &&
 				errno == EINTR)
 			continue;
 
-		if (bluealsa_dbus_connection_poll_dispatch(&dbus_ctx, pfds, pfds_len))
+		if (fds[0].revents & POLLIN)
+			break;
+
+		if (ba_dbus_connection_poll_dispatch(&dbus_ctx, &fds[1], nfds))
 			while (dbus_connection_dispatch(dbus_ctx.conn) == DBUS_DISPATCH_DATA_REMAINS)
 				continue;
 
 	}
 
+	for (size_t i = workers_count; i > 0; i--)
+		io_worker_stop(i - 1);
+	free(workers);
+
+	ba_dbus_connection_ctx_free(&dbus_ctx);
 	return EXIT_SUCCESS;
 }
